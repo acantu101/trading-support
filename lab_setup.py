@@ -19,10 +19,20 @@ import time
 import signal
 import shutil
 import argparse
+import resource
 import subprocess
 import multiprocessing
 from pathlib import Path
 from datetime import datetime
+
+# ─────────────────────────────────────────────
+#  RESOURCE LIMITS
+#  Keeps processes alive but safe — OOM killer
+#  won't touch them, VM stays responsive.
+# ─────────────────────────────────────────────
+CPU_LIMIT_PERCENT  = 50       # oms_client burns at most 50% of one core
+MEM_LIMIT_MB       = 256      # mdf_feed_handler caps at 256 MB
+LOG_LIMIT_MB       = 50       # fix_engine log capped at 50 MB on disk
 
 # ─────────────────────────────────────────────
 #  LAB ROOT DIRECTORY STRUCTURE
@@ -153,27 +163,53 @@ def _write_sample_logs():
 #  PROCESS WORKERS  (run in background)
 # ─────────────────────────────────────────────
 
-def _cpu_spin(name: str):
-    """Pure CPU burn — simulates a hung oms_client."""
+def _cpu_spin(name: str, limit_percent: int = CPU_LIMIT_PERCENT):
+    """
+    Throttled CPU burn — simulates a hung oms_client pegging the CPU
+    without going to 100% and triggering the OOM killer.
+    Burns for (limit_percent)ms then sleeps for (100-limit_percent)ms
+    per 100ms window, keeping usage at exactly limit_percent%.
+    """
     try:
         import setproctitle
         setproctitle.setproctitle(name)
     except ImportError:
         pass
+    burn  = limit_percent / 100        # fraction of each cycle to burn
+    sleep = 1.0 - burn                 # fraction to sleep
+    cycle = 0.1                        # 100ms window
     while True:
-        pass   # 100% CPU
+        deadline = time.time() + cycle * burn
+        while time.time() < deadline:
+            pass                       # busy-wait (CPU burn)
+        time.sleep(cycle * sleep)      # yield (CPU idle)
 
 
-def _memory_leak(name: str, chunk_mb: int = 5, interval: float = 0.5):
-    """Steadily allocates RAM — simulates a leaking mdf_feed handler."""
+def _memory_leak(name: str, chunk_mb: int = 2, interval: float = 0.5,
+                 limit_mb: int = MEM_LIMIT_MB):
+    """
+    Capped memory leak — allocates RAM in chunks until it hits limit_mb,
+    then holds steady. Simulates a leaking mdf_feed handler without
+    exhausting VM memory and triggering the OOM killer.
+    """
     try:
         import setproctitle
         setproctitle.setproctitle(name)
     except ImportError:
+        pass
+    # Set a hard virtual memory limit via the OS so the kernel enforces it
+    limit_bytes = limit_mb * 1024 * 1024
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes * 2, limit_bytes * 2))
+    except Exception:
         pass
     held = []
+    total = 0
     while True:
-        held.append(b"X" * (chunk_mb * 1024 * 1024))
+        if total + chunk_mb <= limit_mb:
+            held.append(b"X" * (chunk_mb * 1024 * 1024))
+            total += chunk_mb
+        # Once capped, just hold the memory and sleep — stays visible in ps/top
         time.sleep(interval)
 
 
@@ -203,21 +239,36 @@ def _zombie_factory(name: str, count: int = 5):
         time.sleep(60)
 
 
-def _log_spammer(name: str, path: str, interval: float = 0.05):
-    """Writes log lines rapidly — simulates runaway logging."""
+def _log_spammer(name: str, path: str, interval: float = 0.05,
+                 limit_mb: int = LOG_LIMIT_MB):
+    """
+    Size-capped log spammer — writes rapidly until the log hits limit_mb,
+    then pauses. Simulates a runaway fix_engine logger without filling
+    the disk entirely. Resumes if the file is truncated (as the student
+    is expected to do).
+    """
     try:
         import setproctitle
         setproctitle.setproctitle(name)
     except ImportError:
         pass
-    with open(path, "a") as f:
-        counter = 0
-        while True:
-            f.write(f"[{datetime.now().isoformat()}] DEBUG market tick #{counter}: "
-                    f"AAPL=189.{counter % 100:02d} GOOGL=175.{counter % 100:02d}\n")
-            f.flush()
-            counter += 1
-            time.sleep(interval)
+    limit_bytes = limit_mb * 1024 * 1024
+    counter = 0
+    while True:
+        try:
+            if os.path.getsize(path) < limit_bytes:
+                with open(path, "a") as f:
+                    f.write(
+                        f"[{datetime.now().isoformat()}] DEBUG market tick #{counter}: "
+                        f"AAPL=189.{counter % 100:02d} GOOGL=175.{counter % 100:02d}\n"
+                    )
+                counter += 1
+                time.sleep(interval)
+            else:
+                # Cap reached — pause until truncated by the student
+                time.sleep(1)
+        except FileNotFoundError:
+            time.sleep(1)
 
 
 # ─────────────────────────────────────────────
@@ -243,16 +294,18 @@ def _load_pids() -> dict:
 # ─────────────────────────────────────────────
 
 def launch_scenario_1():
-    """Hung OMS client — 100% CPU."""
+    """Hung OMS client — throttled CPU spike."""
     header("Scenario 1 — Hung oms_client (CPU Spike)")
     print("  A trader reports their OMS is unresponsive.")
-    print("  Suspected: oms_client has hung and is pegging a CPU core.\n")
+    print(f"  Suspected: oms_client has hung and is pegging ~{CPU_LIMIT_PERCENT}% CPU.\n")
 
     for i in range(2):   # Launch 2 instances for realism
-        p = multiprocessing.Process(target=_cpu_spin, args=("oms_client",), daemon=False)
+        p = multiprocessing.Process(
+            target=_cpu_spin, args=("oms_client", CPU_LIMIT_PERCENT), daemon=False
+        )
         p.start()
         _save_pid(f"oms_client_{i}", p.pid)
-        ok(f"oms_client spawned  PID={p.pid}")
+        ok(f"oms_client spawned  PID={p.pid}  (capped at {CPU_LIMIT_PERCENT}% CPU)")
 
     print(f"""
 {BOLD}── Your Tasks ──────────────────────────────────────{RESET}
@@ -281,11 +334,11 @@ def launch_scenario_2():
     print("  mdf_feed_handler is not releasing memory between sessions.\n")
 
     p = multiprocessing.Process(
-        target=_memory_leak, args=("mdf_feed_handler", 10, 0.3), daemon=False
+        target=_memory_leak, args=("mdf_feed_handler", 2, 0.3, MEM_LIMIT_MB), daemon=False
     )
     p.start()
     _save_pid("mdf_feed_handler", p.pid)
-    ok(f"mdf_feed_handler spawned  PID={p.pid}")
+    ok(f"mdf_feed_handler spawned  PID={p.pid}  (grows to {MEM_LIMIT_MB}MB then holds)")
 
     print(f"""
 {BOLD}── Your Tasks ──────────────────────────────────────{RESET}
@@ -353,11 +406,11 @@ def launch_scenario_4():
 
     log_path = str(DIRS["fix_logs"] / "fix_engine_debug.log")
     p = multiprocessing.Process(
-        target=_log_spammer, args=("fix_engine", log_path, 0.01), daemon=False
+        target=_log_spammer, args=("fix_engine", log_path, 0.01, LOG_LIMIT_MB), daemon=False
     )
     p.start()
     _save_pid("fix_engine_logger", p.pid)
-    ok(f"fix_engine log spammer spawned  PID={p.pid}")
+    ok(f"fix_engine log spammer spawned  PID={p.pid}  (capped at {LOG_LIMIT_MB}MB)")
     ok(f"Log file: {log_path}")
 
     print(f"""
