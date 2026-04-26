@@ -215,8 +215,12 @@ def _memory_leak(name: str, chunk_mb: int = 2, interval: float = 0.5,
 
 def _zombie_factory(name: str, count: int = 5):
     """
-    Spawns children then lets them die without wait() —
-    simulates a crashed risk engine leaving zombie PIDs.
+    Spawns children that exit immediately while the parent stays alive
+    and never calls wait() — this is what creates real zombie entries.
+
+    Key fix: we use SIG_DFL (default) NOT SIG_IGN for SIGCHLD.
+    SIG_IGN on Linux tells the kernel to auto-reap children (no zombies).
+    SIG_DFL leaves children in Z state until the parent calls wait().
     """
     try:
         import setproctitle
@@ -224,17 +228,21 @@ def _zombie_factory(name: str, count: int = 5):
     except ImportError:
         pass
 
-    # Ignore SIGCHLD so children become zombies
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    # Use default SIGCHLD handler — do NOT ignore it or Linux auto-reaps
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
-    for _ in range(count):
+    zombie_pids = []
+    for i in range(count):
         pid = os.fork()
         if pid == 0:
-            # child exits immediately → becomes zombie
+            # Child: exit immediately without cleanup → becomes zombie
             os._exit(0)
-        time.sleep(0.3)
+        else:
+            # Parent: record the child PID, never call wait()
+            zombie_pids.append(pid)
+            time.sleep(0.5)   # stagger so each zombie gets its own PID slot
 
-    # Parent stays alive so zombies persist
+    # Parent stays alive forever — zombies persist until parent is killed
     while True:
         time.sleep(60)
 
