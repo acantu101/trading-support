@@ -4,7 +4,9 @@
 
 This runbook covers Kubernetes pod debugging, deployment issues, configuration problems, and ArgoCD sync failures in a trading environment. All scenarios map to `lab_k8s.py` (K8-01 through K8-06).
 
----
+Check out the training slides for more detailed info on Kubernetes: [Google Slides Link](https://docs.google.com/presentation/d/17WSNZt3aqfCereHa1yZXs30Y6SsymtKkJxSkySL8-Yg/edit?usp=sharing)
+
+
 
 ## Diagnostic First Steps
 
