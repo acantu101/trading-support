@@ -852,10 +852,321 @@ CANCEL:
 """)
 
 
+def launch_scenario_6():
+    header("Scenario F-06 — Cancel and Replace Orders")
+    print("  Send a NewOrder, cancel it, place another and replace it.\n")
+
+    FIX_PORT = 9878
+    pid = spawn(_fix_acceptor, (FIX_PORT,), "fix_acceptor_f06")
+    ok(f"FIX acceptor on port {FIX_PORT}  PID={pid}")
+    time.sleep(0.5)
+
+    cancel_replace = DIRS["scripts"] / "cancel_replace.py"
+    cancel_replace.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"
+F-06: Cancel and Replace orders over a live FIX session.
+Demonstrates: 35=F (OrderCancelRequest) and 35=G (OrderCancelReplaceRequest).
+Usage: python3 {cancel_replace}
+\"\"\"
+import socket, time
+from datetime import datetime
+
+SOH = "\\x01"
+HOST, PORT   = "127.0.0.1", {FIX_PORT}
+SENDER, TARGET = "FIRM_OMS", "EXCHANGE_A"
+seq = [1]
+
+def ts(): return datetime.utcnow().strftime("%Y%m%d-%H:%M:%S")
+def checksum(m): return f"{{sum(ord(c) for c in m) % 256:03d}}"
+def build(fields):
+    body = SOH.join(f"{{k}}={{v}}" for k, v in fields.items()) + SOH
+    hdr  = f"8=FIX.4.4{{SOH}}9={{len(body)}}{{SOH}}"
+    full = hdr + body
+    return full + f"10={{checksum(full)}}{{SOH}}"
+
+def send_msg(conn, label, fields):
+    msg = build(fields)
+    conn.sendall(msg.encode())
+    readable = msg.replace(SOH, " | ")
+    print(f"  → SENT [{label}]: {{readable[:120]}}...")
+    seq[0] += 1
+
+def recv_msg(conn, label):
+    data = conn.recv(4096).decode(errors="replace")
+    readable = data.replace(SOH, " | ")
+    # Extract key fields for display
+    fields = {{}}
+    for pair in data.split(SOH):
+        if "=" in pair:
+            t, v = pair.split("=", 1)
+            fields[t.strip()] = v.strip()
+    status_map = {{"0":"New","1":"PartialFill","2":"Filled","4":"Cancelled","8":"Rejected"}}
+    exec_map   = {{"0":"New","2":"Fill","4":"Cancelled","5":"Replace","8":"Rejected"}}
+    mt  = fields.get("35","?")
+    ord_status = status_map.get(fields.get("39",""), fields.get("39","?"))
+    exec_type  = exec_map.get(fields.get("150",""), fields.get("150","?"))
+    print(f"  ← RECV [{label}]: 35={{mt}}  39={{ord_status}}  150={{exec_type}}  58={{fields.get('58','-')}}")
+    return fields
+
+conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+conn.settimeout(5)
+conn.connect((HOST, PORT))
+print(f"Connected to {{HOST}}:{{PORT}}\\n")
+
+# ── Step 1: Logon ──────────────────────────────────────────
+print("Step 1: Logon")
+send_msg(conn, "Logon", {{"35":"A","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),"98":"0","108":"30"}})
+recv_msg(conn, "Logon ACK")
+
+# ── Step 2: Send order ORD-001 ────────────────────────────
+print("\\nStep 2: NewOrderSingle — BUY 100 AAPL @ 185.50")
+send_msg(conn, "NewOrder", {{
+    "35":"D","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),
+    "11":"ORD-001","55":"AAPL","54":"1","60":ts(),
+    "38":"100","40":"2","44":"185.50","59":"0",
+}})
+recv_msg(conn, "ExecReport")
+
+# ── Step 3: Cancel ORD-001 ────────────────────────────────
+print("\\nStep 3: OrderCancelRequest — cancel ORD-001")
+print("  Tags: 35=F  41=OrigClOrdID (order being cancelled)  11=new ClOrdID for this request")
+send_msg(conn, "CancelReq", {{
+    "35":"F","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),
+    "41":"ORD-001",   # OrigClOrdID — the order we want to cancel
+    "11":"ORD-002",   # new ClOrdID for this cancel request
+    "55":"AAPL","54":"1","38":"100",
+}})
+cancel_resp = recv_msg(conn, "CancelACK")
+print(f"  OrdStatus 4=Cancelled ✓" if cancel_resp.get("39") == "4" else "  ✗ unexpected status")
+
+# ── Step 4: Send new order ORD-003 ───────────────────────
+print("\\nStep 4: NewOrderSingle — SELL 50 GOOGL @ 141.20")
+send_msg(conn, "NewOrder", {{
+    "35":"D","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),
+    "11":"ORD-003","55":"GOOGL","54":"2","60":ts(),
+    "38":"50","40":"2","44":"141.20","59":"0",
+}})
+recv_msg(conn, "ExecReport")
+
+# ── Step 5: Replace ORD-003 — change qty 50 → 75 ────────
+print("\\nStep 5: OrderCancelReplaceRequest — change qty 50 → 75 on ORD-003")
+print("  Tags: 35=G  41=OrigClOrdID  11=new ClOrdID  38=new qty  44=new price")
+send_msg(conn, "ReplaceReq", {{
+    "35":"G","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),
+    "41":"ORD-003",   # OrigClOrdID — order being replaced
+    "11":"ORD-004",   # new ClOrdID for the amended order
+    "55":"GOOGL","54":"2","60":ts(),
+    "38":"75",        # new qty
+    "40":"2","44":"141.20","59":"0",
+}})
+replace_resp = recv_msg(conn, "ReplaceACK")
+print(f"  OrdStatus 0=New (replaced) ✓" if replace_resp.get("39") == "0" else "  ✗ unexpected status")
+
+# ── Step 6: Logout ────────────────────────────────────────
+print("\\nStep 6: Logout")
+send_msg(conn, "Logout", {{"35":"5","49":SENDER,"56":TARGET,"34":str(seq[0]),"52":ts(),"58":"Done"}})
+try: recv_msg(conn, "Logout ACK")
+except socket.timeout: pass
+
+conn.close()
+print("\\nSession complete.")
+print(f"  cat {DIRS['logs']}/fix_acceptor.log")
+print(\"\"\"
+Key takeaways:
+  35=F (Cancel):  41=OrigClOrdID identifies the order to cancel
+                  Response: 39=4 (Cancelled), ExecType=4
+  35=G (Replace): 41=OrigClOrdID identifies the order to amend
+                  38/44 carry the NEW qty/price
+                  Response: 39=0 (New — replaced order is now live), ExecType=5
+  Both require a new ClOrdID (tag 11) for the request itself.
+\"\"\")
+""")
+    ok(f"Cancel/replace script: {cancel_replace}")
+
+    print(f"""
+{BOLD}── FIX acceptor on port {FIX_PORT} ──────────────────────────────────{RESET}
+
+{BOLD}── Run the cancel/replace session ──────────────────────{RESET}
+{CYAN}       python3 {cancel_replace}{RESET}
+
+{BOLD}── Watch the acceptor log ───────────────────────────────{RESET}
+{CYAN}       tail -f {DIRS["logs"]}/fix_acceptor.log{RESET}
+
+{BOLD}── Message flow ─────────────────────────────────────────{RESET}
+  35=D  NewOrderSingle       → acceptor fills it (39=2)
+  35=F  OrderCancelRequest   → acceptor cancels  (39=4, ExecType=4)
+  35=D  NewOrderSingle       → acceptor fills it (39=2)
+  35=G  CancelReplaceRequest → acceptor replaces (39=0, ExecType=5)
+  35=5  Logout
+
+{BOLD}── Key tags for cancel/replace ──────────────────────────{RESET}
+  41 = OrigClOrdID   the ClOrdID of the order being cancelled/replaced
+  11 = ClOrdID       a NEW unique ID for this cancel/replace request
+  38 = OrderQty      on 35=G: the NEW quantity after amendment
+  44 = Price         on 35=G: the NEW price after amendment
+  ExecType 4=Cancelled  5=Replace
+  OrdStatus 4=Cancelled  0=New (replaced order now live)
+""")
+
+
+def launch_scenario_7():
+    header("Scenario F-07 — Sequence Number Gap & Recovery")
+    print("  Trigger a live seq gap, receive a Reject, recover with ResendRequest.\n")
+
+    FIX_PORT = 9878
+    pid = spawn(_fix_acceptor, (FIX_PORT,), "fix_acceptor_f07")
+    ok(f"FIX acceptor on port {FIX_PORT}  PID={pid}")
+    time.sleep(0.5)
+
+    seq_gap = DIRS["scripts"] / "seq_gap_recovery.py"
+    seq_gap.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"
+F-07: Trigger a sequence gap and recover using ResendRequest (35=2).
+Demonstrates: gap detection, Reject (35=3), ResendRequest (35=2), PossDupFlag (43=Y).
+Usage: python3 {seq_gap}
+\"\"\"
+import socket, time
+from datetime import datetime
+
+SOH = "\\x01"
+HOST, PORT   = "127.0.0.1", {FIX_PORT}
+SENDER, TARGET = "FIRM_OMS", "EXCHANGE_A"
+seq = [1]
+
+def ts(): return datetime.utcnow().strftime("%Y%m%d-%H:%M:%S")
+def checksum(m): return f"{{sum(ord(c) for c in m) % 256:03d}}"
+def build(fields):
+    body = SOH.join(f"{{k}}={{v}}" for k, v in fields.items()) + SOH
+    hdr  = f"8=FIX.4.4{{SOH}}9={{len(body)}}{{SOH}}"
+    full = hdr + body
+    return full + f"10={{checksum(full)}}{{SOH}}"
+
+def send_msg(conn, label, fields, show_seq=True):
+    msg = build(fields)
+    conn.sendall(msg.encode())
+    seq_display = f" seq={{fields.get('34','?')}}" if show_seq else ""
+    print(f"  → SENT [{{label}}]{{seq_display}}: 35={{fields.get('35','?')}}")
+    seq[0] += 1
+
+def recv_msg(conn, label):
+    try:
+        data = conn.recv(4096).decode(errors="replace")
+    except socket.timeout:
+        print(f"  ← RECV [{{label}}]: TIMEOUT")
+        return {{}}
+    fields = {{}}
+    for pair in data.split(SOH):
+        if "=" in pair:
+            t, v = pair.split("=", 1)
+            fields[t.strip()] = v.strip()
+    mt = fields.get("35","?")
+    ref = f"  RefSeq={{fields.get('45','?')}}  Text={{fields.get('58','?')}}" if mt == "3" else ""
+    dup = f"  PossDupFlag={{fields.get('43','N')}}" if fields.get("43") else ""
+    print(f"  ← RECV [{{label}}]: 35={{mt}}  seq={{fields.get('34','?')}}{{ref}}{{dup}}")
+    return fields
+
+conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+conn.settimeout(5)
+conn.connect((HOST, PORT))
+print(f"Connected to {{HOST}}:{{PORT}}\\n")
+
+# ── Step 1: Logon (seq=1) ─────────────────────────────────
+print("Step 1: Logon (seq=1) — normal")
+send_msg(conn, "Logon", {{"35":"A","49":SENDER,"56":TARGET,"34":"1","52":ts(),"98":"0","108":"30"}})
+recv_msg(conn, "Logon ACK")
+
+# ── Step 2: Send order at seq=2 ───────────────────────────
+print("\\nStep 2: NewOrderSingle at seq=2 — normal")
+send_msg(conn, "NewOrder", {{
+    "35":"D","49":SENDER,"56":TARGET,"34":"2","52":ts(),
+    "11":"ORD-001","55":"AAPL","54":"1","60":ts(),
+    "38":"100","40":"2","44":"185.50","59":"0",
+}})
+recv_msg(conn, "ExecReport (Fill)")
+
+# ── Step 3: Intentionally SKIP seq=3, send seq=5 ─────────
+print("\\nStep 3: Intentionally sending seq=5 (skipping seq=3,4)")
+print("  This simulates messages being dropped in transit.")
+send_msg(conn, "Heartbeat (BAD SEQ)", {{"35":"0","49":SENDER,"56":TARGET,"34":"5","52":ts()}})
+
+# The acceptor will detect seq=5 when it expected seq=3
+resp = recv_msg(conn, "REJECT expected")
+if resp.get("35") == "3":
+    print(f"  ✓ Got Reject (35=3) — acceptor detected the gap")
+    print(f"    Reason: {{resp.get('58','?')}}")
+else:
+    print(f"  Note: acceptor responded with 35={{resp.get('35','?')}}")
+
+# ── Step 4: ResendRequest for seq=3,4 ────────────────────
+print("\\nStep 4: Send ResendRequest (35=2) — ask acceptor to retransmit seq=3 and seq=4")
+print("  Tag 7=BeginSeqNo  Tag 16=EndSeqNo")
+send_msg(conn, "ResendRequest", {{
+    "35":"2","49":SENDER,"56":TARGET,"34":"6","52":ts(),
+    "7":"3",    # BeginSeqNo — first missing message
+    "16":"4",   # EndSeqNo   — last missing message
+}})
+
+# ── Step 5: Receive retransmitted messages with PossDupFlag ──
+print("\\nStep 5: Receiving retransmitted messages (expect PossDupFlag=Y)")
+for i in range(2):
+    r = recv_msg(conn, f"Retransmit {{i+1}}")
+    if r.get("43") == "Y":
+        print(f"  ✓ PossDupFlag=Y confirmed — safe to process, not a new message")
+
+# ── Step 6: Logout ────────────────────────────────────────
+print("\\nStep 6: Logout")
+send_msg(conn, "Logout", {{"35":"5","49":SENDER,"56":TARGET,"34":"7","52":ts(),"58":"Done"}})
+try: recv_msg(conn, "Logout ACK")
+except socket.timeout: pass
+
+conn.close()
+print("\\nSession complete.")
+print(f"  cat {DIRS['logs']}/fix_acceptor.log")
+print(\"\"\"
+Key takeaways:
+  Gap = sent seq=5 when acceptor expected seq=3
+  Acceptor sends Reject (35=3) with text "MsgSeqNum too low"
+  ResendRequest (35=2): tag 7=BeginSeqNo  tag 16=EndSeqNo
+  Retransmitted messages carry PossDupFlag=Y (43=Y)
+  → Do NOT treat PossDupFlag=Y messages as new orders
+  → Check your trade blotter — if the order is already there, skip it
+  If gap is unrecoverable: Logout → reconnect → Logon with ResetOnLogon=Y (tag 384)
+\"\"\")
+""")
+    ok(f"Seq gap recovery script: {seq_gap}")
+
+    print(f"""
+{BOLD}── FIX acceptor on port {FIX_PORT} ──────────────────────────────────{RESET}
+
+{BOLD}── Run the sequence gap recovery session ───────────────{RESET}
+{CYAN}       python3 {seq_gap}{RESET}
+
+{BOLD}── Watch the acceptor log ───────────────────────────────{RESET}
+{CYAN}       tail -f {DIRS["logs"]}/fix_acceptor.log{RESET}
+
+{BOLD}── What happens step by step ────────────────────────────{RESET}
+  seq=1  Logon          → accepted
+  seq=2  NewOrderSingle → filled
+  seq=5  Heartbeat      → REJECTED (gap: expected 3, got 5)
+  seq=6  ResendRequest  → acceptor retransmits seq=3,4 with 43=Y
+  seq=7  Logout         → clean exit
+
+{BOLD}── Key rules ────────────────────────────────────────────{RESET}
+  Gap detected   → Reject (35=3) tag 45=RefSeqNum  tag 58=reason
+  Recovery       → ResendRequest (35=2) tag 7=BeginSeqNo  tag 16=EndSeqNo
+  Retransmit     → PossDupFlag=Y (43=Y) — already processed, do not duplicate
+  Hard reset     → Logout → reconnect → Logon with ResetOnLogon=Y (384=Y)
+  Duplicate check: if ClOrdID already in blotter → ignore the resent message
+""")
+
+
 def launch_scenario_99():
     header("Scenario 99 — ALL FIX Scenarios")
     for fn in [launch_scenario_1, launch_scenario_2, launch_scenario_3,
-               launch_scenario_4, launch_scenario_5]:
+               launch_scenario_4, launch_scenario_5, launch_scenario_6,
+               launch_scenario_7]:
         fn(); time.sleep(0.3)
 
 
@@ -878,6 +1189,8 @@ SCENARIO_MAP = {
     3:  (launch_scenario_3, "F-03  Diagnose a broken FIX session"),
     4:  (launch_scenario_4, "F-04  Send a NewOrderSingle"),
     5:  (launch_scenario_5, "F-05  Tag reference & ExecReport walkthrough"),
+    6:  (launch_scenario_6, "F-06  Cancel and replace orders"),
+    7:  (launch_scenario_7, "F-07  Sequence gap & ResendRequest recovery"),
     99: (launch_scenario_99, "     ALL scenarios"),
 }
 
