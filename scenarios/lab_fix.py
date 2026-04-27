@@ -173,7 +173,7 @@ def _fix_acceptor(port: int):
                             "17": f"EXEC-{seq_num[0]:04d}",
                             "37": f"ORD-{seq_num[0]:04d}",
                             "11": fields.get("11", "?"),
-                            "39": "2",   # Filled
+                            "39": "2",    # OrdStatus = Filled
                             "55": fields.get("55", "AAPL"),
                             "54": fields.get("54", "1"),
                             "38": fields.get("38", "100"),
@@ -181,7 +181,53 @@ def _fix_acceptor(port: int):
                             "31": fields.get("44", "185.50"),
                             "14": fields.get("38", "100"),
                             "6":  fields.get("44", "185.50"),
-                            "150": "2", "151": "0",
+                            "150": "2",   # ExecType = Fill
+                            "151": "0",   # LeavesQty = 0
+                        })
+
+                    elif msg_type == "F":  # OrderCancelRequest → confirm cancel
+                        seq_num[0] += 1
+                        send(conn, {
+                            "8": "FIX.4.4", "35": "8",
+                            "49": target, "56": sender,
+                            "34": str(seq_num[0]), "52": ts,
+                            "17": f"EXEC-{seq_num[0]:04d}",
+                            "37": fields.get("41", f"ORD-{seq_num[0]:04d}"),
+                            "11": fields.get("11", "?"),
+                            "41": fields.get("41", "?"),   # OrigClOrdID echoed back
+                            "39": "4",    # OrdStatus = Cancelled
+                            "55": fields.get("55", "?"),
+                            "54": fields.get("54", "1"),
+                            "38": fields.get("38", "0"),
+                            "32": "0",    # LastQty = 0
+                            "31": "0",    # LastPx  = 0
+                            "14": "0",    # CumQty  = 0
+                            "6":  "0",    # AvgPx   = 0
+                            "150": "4",   # ExecType = Cancelled
+                            "151": "0",   # LeavesQty = 0
+                        })
+
+                    elif msg_type == "G":  # OrderCancelReplaceRequest → ack replace
+                        seq_num[0] += 1
+                        send(conn, {
+                            "8": "FIX.4.4", "35": "8",
+                            "49": target, "56": sender,
+                            "34": str(seq_num[0]), "52": ts,
+                            "17": f"EXEC-{seq_num[0]:04d}",
+                            "37": fields.get("41", f"ORD-{seq_num[0]:04d}"),
+                            "11": fields.get("11", "?"),
+                            "41": fields.get("41", "?"),   # OrigClOrdID echoed back
+                            "39": "0",    # OrdStatus = New (replaced order now active)
+                            "55": fields.get("55", "?"),
+                            "54": fields.get("54", "1"),
+                            "38": fields.get("38", "0"),
+                            "44": fields.get("44", "0"),
+                            "32": "0",
+                            "31": "0",
+                            "14": "0",
+                            "6":  "0",
+                            "150": "5",   # ExecType = Replace
+                            "151": fields.get("38", "0"),  # LeavesQty = new qty
                         })
 
                     elif msg_type == "5":  # Logout
