@@ -441,6 +441,271 @@ SELECT NULLIF(quantity, 0) AS qty FROM trades;           -- return NULL if 0
 
 ---
 
+## Table Creation & Constraints
+
+```sql
+-- Full table creation with constraints
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- unique row ID, auto-increments
+    trader_id   TEXT    NOT NULL,                   -- cannot be empty
+    symbol      TEXT    NOT NULL,
+    alert_type  TEXT    NOT NULL CHECK (alert_type IN ('LIMIT_BREACH', 'LARGE_TRADE', 'PATTERN')),
+    severity    TEXT    DEFAULT 'LOW',              -- default value if not provided
+    created_at  TEXT    DEFAULT (datetime('now')),
+    resolved    INTEGER DEFAULT 0,                  -- 0 = false, 1 = true (SQLite has no BOOLEAN)
+    notes       TEXT,                               -- nullable, no constraint
+    FOREIGN KEY (trader_id) REFERENCES traders(trader_id)  -- enforces referential integrity
+);
+
+-- Add a unique constraint (no two alerts of same type for same trader+symbol)
+CREATE UNIQUE INDEX idx_alerts_unique
+    ON alerts(trader_id, symbol, alert_type);
+
+-- Create a table as a snapshot of a query result
+CREATE TABLE daily_pnl_snapshot AS
+SELECT
+    DATE(trade_time) AS trade_date,
+    trader_id,
+    SUM(CASE side WHEN 'SELL' THEN quantity * price ELSE -(quantity * price) END) AS daily_net
+FROM trades
+WHERE status = 'FILLED'
+GROUP BY DATE(trade_time), trader_id;
+
+-- Drop a table (irreversible — always confirm before running)
+DROP TABLE IF EXISTS daily_pnl_snapshot;
+```
+
+### Constraint Types
+
+| Constraint | What it enforces |
+|---|---|
+| `PRIMARY KEY` | Unique, not null — identifies each row |
+| `NOT NULL` | Column must always have a value |
+| `UNIQUE` | No two rows can have the same value |
+| `CHECK` | Value must pass a condition |
+| `DEFAULT` | Value used when not provided on insert |
+| `FOREIGN KEY` | Value must exist in another table |
+
+---
+
+## Updates & Deletes
+
+### UPDATE patterns
+
+```sql
+-- Basic update — change one row
+UPDATE trades
+SET status = 'CANCELLED'
+WHERE trade_id = 'TRD-00042';
+
+-- Update multiple columns at once
+UPDATE positions
+SET net_qty    = net_qty + 100,
+    avg_price  = 185.50,
+    updated_at = datetime('now')
+WHERE trader_id = 'T001'
+  AND symbol    = 'AAPL';
+
+-- Update based on a calculation
+UPDATE trades
+SET price = price * 0.5           -- stock split adjustment
+WHERE symbol = 'NVDA'
+  AND trade_time < '2024-06-10';
+
+-- Update using a subquery
+UPDATE positions
+SET avg_price = (
+    SELECT ROUND(SUM(quantity * price) / SUM(quantity), 4)
+    FROM trades
+    WHERE trades.trader_id = positions.trader_id
+      AND trades.symbol    = positions.symbol
+      AND status           = 'FILLED'
+)
+WHERE trader_id = 'T001';
+
+-- Safe pattern: always SELECT first to verify rows before updating
+SELECT * FROM trades WHERE symbol = 'NVDA' AND trade_time < '2024-06-10';
+-- if output looks right, then run the UPDATE
+```
+
+### DELETE patterns
+
+```sql
+-- Delete specific rows
+DELETE FROM alerts
+WHERE resolved = 1
+  AND created_at < datetime('now', '-30 days');
+
+-- Delete with subquery
+DELETE FROM positions
+WHERE trader_id NOT IN (SELECT trader_id FROM traders);
+
+-- Truncate equivalent in SQLite (delete all rows, keep table structure)
+DELETE FROM daily_pnl_snapshot;
+
+-- Safe pattern: SELECT before DELETE
+SELECT COUNT(*) FROM alerts WHERE resolved = 1;
+-- verify the count, then run DELETE
+```
+
+### UPDATE vs DELETE safety rules
+
+- Always run a `SELECT` with the same `WHERE` clause first — verify the rows before changing them
+- Wrap in `BEGIN/ROLLBACK` to preview changes without committing:
+
+```sql
+BEGIN;
+UPDATE trades SET status = 'CANCELLED' WHERE symbol = 'AAPL' AND status = 'PENDING';
+SELECT * FROM trades WHERE symbol = 'AAPL';   -- inspect the result
+ROLLBACK;                                      -- undo if something looks wrong
+-- COMMIT; when satisfied
+```
+
+---
+
+## Basic Database Maintenance
+
+### Check table and index sizes
+
+```sql
+-- SQLite: list all tables and indexes in the database
+SELECT type, name, tbl_name
+FROM sqlite_master
+WHERE type IN ('table', 'index')
+ORDER BY type, name;
+
+-- Row counts across all main tables
+SELECT 'trades'    AS tbl, COUNT(*) AS rows FROM trades
+UNION ALL
+SELECT 'positions',         COUNT(*) FROM positions
+UNION ALL
+SELECT 'traders',           COUNT(*) FROM traders
+UNION ALL
+SELECT 'orders_audit',      COUNT(*) FROM orders_audit;
+
+-- SQLite database file size (run in shell, not sqlite3)
+-- ls -lh /tmp/lab_sql/db/trading.db
+```
+
+```sql
+-- PostgreSQL: table sizes on disk
+SELECT
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    pg_size_pretty(pg_relation_size(relid))        AS table_size,
+    pg_size_pretty(pg_indexes_size(relid))         AS index_size
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
+```
+
+### VACUUM — reclaim space after deletes
+
+```sql
+-- SQLite: reclaim space from deleted rows (reduces file size)
+VACUUM;
+
+-- SQLite: rebuild a specific table
+VACUUM trades;
+```
+
+```sql
+-- PostgreSQL: reclaim dead row space (runs automatically but can be forced)
+VACUUM trades;
+
+-- PostgreSQL: full vacuum — rewrites entire table, maximum space recovery
+-- WARNING: locks the table, do not run during market hours
+VACUUM FULL trades;
+
+-- PostgreSQL: vacuum and update query planner statistics
+VACUUM ANALYZE trades;
+```
+
+### ANALYZE — update query planner statistics
+
+```sql
+-- SQLite: analyze index statistics so the query planner makes better choices
+ANALYZE;
+
+-- Analyze a specific table
+ANALYZE big_trades;
+```
+
+```sql
+-- PostgreSQL: update statistics for a specific table
+ANALYZE trades;
+
+-- Check when a table was last analyzed
+SELECT relname, last_analyze, last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname = 'trades';
+```
+
+### Index maintenance
+
+```sql
+-- Show all indexes in SQLite
+SELECT name, tbl_name, sql
+FROM sqlite_master
+WHERE type = 'index';
+
+-- Show indexes on a specific table
+PRAGMA index_list('big_trades');
+
+-- Show which columns an index covers
+PRAGMA index_info('idx_bt');
+
+-- Drop an unused index (indexes slow down writes — remove ones not being used)
+DROP INDEX IF EXISTS idx_bt;
+
+-- Rebuild an index (SQLite)
+REINDEX idx_bt;
+
+-- Rebuild all indexes on a table
+REINDEX big_trades;
+```
+
+```sql
+-- PostgreSQL: check if indexes are actually being used
+SELECT
+    indexrelname AS index_name,
+    idx_scan     AS times_used,
+    idx_tup_read AS rows_read
+FROM pg_stat_user_indexes
+WHERE relname = 'trades'
+ORDER BY idx_scan ASC;    -- indexes with 0 or low scans are candidates for removal
+```
+
+### Backup and restore (shell commands)
+
+```bash
+# SQLite backup — copy the file (safe while connected if using WAL mode)
+cp /tmp/lab_sql/db/trading.db /tmp/lab_sql/db/trading.db.bak
+
+# SQLite dump to SQL file (full backup as SQL statements)
+sqlite3 /tmp/lab_sql/db/trading.db .dump > trading_backup.sql
+
+# SQLite restore from SQL dump
+sqlite3 /tmp/lab_sql/db/trading_restored.db < trading_backup.sql
+
+# PostgreSQL dump
+pg_dump -U postgres trading_db > trading_backup.sql
+
+# PostgreSQL restore
+psql -U postgres trading_db < trading_backup.sql
+```
+
+### Maintenance schedule reference
+
+| Task | SQLite | PostgreSQL | When to run |
+|---|---|---|---|
+| Reclaim deleted row space | `VACUUM` | `VACUUM` | After bulk deletes |
+| Update query planner stats | `ANALYZE` | `ANALYZE` | After large data loads |
+| Rebuild corrupted index | `REINDEX` | `REINDEX` | After crash recovery |
+| Full compaction | `VACUUM` | `VACUUM FULL` | Off-hours only |
+| Check unused indexes | `sqlite_master` | `pg_stat_user_indexes` | Monthly review |
+
+---
+
 ## Escalation Criteria
 
 | Condition | Action |
