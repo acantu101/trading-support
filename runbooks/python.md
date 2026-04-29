@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers scripting patterns used by support engineers in trading environments: log monitoring, log parsing with awk, process watchdogs, REST API clients, FIX message parsing, and Kafka lag monitoring. All scenarios map to `lab_python.py` (P-01 through P-06).
+This runbook covers scripting patterns used by support engineers in trading environments: log monitoring, log parsing with awk, process watchdogs, REST API clients, FIX message parsing, Kafka lag monitoring, and OOP patterns. All scenarios map to `lab_python.py` (P-01 through P-08).
 
 ---
 
@@ -361,6 +361,186 @@ def get_consumer_lag(broker: str, group: str, topic: str) -> dict:
     consumer.close()
     return {tp.partition: end_offsets[tp] - committed[tp] for tp in tps}
 ```
+
+---
+
+## Bash Cheat Sheet for Support Engineers
+
+```bash
+# Process grep (avoid matching the grep itself)
+ps aux | grep '[o]ms_client'
+pgrep -la oms_client
+
+# Follow log with grep filter
+tail -f /var/log/trading/app.log | grep --line-buffered "ERROR\|CRITICAL"
+
+# Run command every N seconds
+watch -n 5 'ps aux --sort=-%cpu | head -10'
+
+# Check if a port is listening
+ss -tlnp | grep :8080
+nc -zv 127.0.0.1 8080 && echo open || echo closed
+
+# Time a command
+time python3 process_trades.py
+
+# Run in background, capture output
+nohup python3 worker.py > /var/log/worker.log 2>&1 &
+echo $! > /var/run/worker.pid
+
+# Kill a process by port
+fuser -k 8080/tcp
+
+# HTTP request from command line
+curl -s http://localhost:8765/api/health | python3 -m json.tool
+wget -qO- http://localhost:8765/api/orders
+
+# Check if a Python package is installed
+python3 -c "import kafka; print(kafka.__version__)"
+pip show kafka-python
+```
+
+---
+
+## P-07 — OOP: Reading a Class Hierarchy
+
+### Key OOP concepts
+
+| Concept | Meaning | Trading example |
+|---|---|---|
+| Class | Blueprint for an object | `RiskCheck`, `Order`, `FIXSession` |
+| Instance | A specific object created from a class | `PositionLimitCheck(max=10_000)` |
+| Inheritance | Child class gets parent's methods (IS-A) | `PositionLimitCheck` IS-A `RiskCheck` |
+| Abstract class | Defines methods subclasses MUST implement | `RiskCheck.check()` must be overridden |
+| `@abstractmethod` | Decorator that enforces override | Any subclass missing `check()` won't instantiate |
+| Composition | Object contains other objects (HAS-A) | `RiskEngine` HAS-A list of `RiskCheck` instances |
+
+### Strategy pattern (most common in trading systems)
+
+```python
+from abc import ABC, abstractmethod
+
+class RiskCheck(ABC):
+    @abstractmethod
+    def check(self, order) -> tuple[bool, str]:
+        pass
+
+class PositionLimitCheck(RiskCheck):
+    def __init__(self, max_position: int):
+        self.max_position = max_position
+
+    def check(self, order) -> tuple[bool, str]:
+        if abs(order.quantity) > self.max_position:
+            return False, f"Position limit breach"
+        return True, "ok"
+
+class RiskEngine:
+    def __init__(self, checks: list[RiskCheck]):
+        self.checks = checks   # composition: engine HAS-A list of checks
+
+    def approve(self, order) -> tuple[bool, list]:
+        failures = [r for c in self.checks
+                    for passed, r in [c.check(order)] if not passed]
+        return len(failures) == 0, failures
+
+# Adding a new check requires zero changes to RiskEngine:
+engine = RiskEngine(checks=[
+    PositionLimitCheck(10_000),
+    NotionalLimitCheck(1_000_000),
+    SymbolBlocklistCheck({"GME", "AMC"}),
+])
+```
+
+**Why strategy pattern matters in trading:**
+- New risk rules (regulatory changes) can be added without modifying the engine
+- Rules can be enabled/disabled per environment (test vs prod)
+- Each rule is independently testable
+
+### `@dataclass` — clean data containers
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Order:
+    order_id:   str
+    symbol:     str
+    side:       str
+    quantity:   int
+    price:      float
+
+# @dataclass auto-generates:
+# __init__(self, order_id, symbol, side, quantity, price)
+# __repr__ → "Order(order_id='ORD-001', symbol='AAPL', ...)"
+# __eq__   → compares all fields
+```
+
+---
+
+## P-08 — OOP: Observer Pattern (Market Data)
+
+### Observer pattern structure
+
+```python
+from abc import ABC, abstractmethod
+
+# Observer interface — anything that wants tick updates
+class TickHandler(ABC):
+    @abstractmethod
+    def on_tick(self, tick) -> None:
+        pass
+
+# Concrete observers — each does something different with the tick
+class BlotterService(TickHandler):
+    def on_tick(self, tick): ...  # update UI
+
+class RiskEngineHandler(TickHandler):
+    def on_tick(self, tick): ...  # recalculate mark-to-market
+
+class AlertHandler(TickHandler):
+    def on_tick(self, tick): ...  # check spread threshold
+
+# Subject — the feed handler that pushes ticks to all subscribers
+class MarketDataFeed:
+    def __init__(self):
+        self._handlers: list[TickHandler] = []
+
+    def subscribe(self, handler: TickHandler):
+        self._handlers.append(handler)
+
+    def publish(self, tick):
+        for handler in self._handlers:
+            handler.on_tick(tick)   # each handler gets every tick
+
+# Wire it up
+feed = MarketDataFeed()
+feed.subscribe(BlotterService())
+feed.subscribe(RiskEngineHandler())
+feed.subscribe(AlertHandler())
+```
+
+### Why this pattern matters for incident diagnosis
+
+When a market data feed goes down, **all observers stop receiving updates simultaneously**:
+- Blotter shows stale quotes
+- Risk engine uses stale mark-to-market values
+- Alert handler stops checking spreads
+
+This is why a single feed outage causes multiple services to report stale data at the same time — they all share the same publisher.
+
+### OOP vs procedural — when you see it in logs
+
+```
+# Procedural: one large function, stack trace shows one frame
+at com.drw.trading.Main.processAll(Main.java:142)
+
+# OOP: multiple classes, stack trace shows the full call chain
+at com.drw.trading.risk.PositionLimitCheck.check(PositionLimitCheck.java:45)
+at com.drw.trading.risk.RiskEngine.approve(RiskEngine.java:88)
+at com.drw.trading.router.OrderRouter.routeOrder(OrderRouter.java:142)
+```
+
+Reading the class names in a Java stack trace tells you which component failed — the OOP structure makes the call chain explicit.
 
 ---
 
