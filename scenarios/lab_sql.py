@@ -629,41 +629,66 @@ print("  In PostgreSQL: SELECT ... FOR UPDATE, advisory locks, SERIALIZABLE isol
     deadlock_notes.write_text("""\
 -- S-06: Deadlock and Locking Notes
 -- ===================================
---
--- In PostgreSQL (production pattern):
+-- This file is a REFERENCE only — not all statements run in SQLite.
+-- Sections are clearly marked: [SQLite] or [PostgreSQL only].
 
--- PATTERN 1: Consistent lock ordering prevents deadlocks
--- Always lock rows in the same order (e.g., by primary key ascending)
+-- ─── PATTERN 1: Consistent lock ordering prevents deadlocks ──────────────
+-- [Both] — concept applies to all databases
+-- Always acquire locks in the same order (e.g., by primary key ascending)
 -- Thread A: lock trader T001, then T002
 -- Thread B: lock trader T001, then T002  ← same order = no deadlock
+--
+-- If threads lock in different orders:
+-- Thread A: lock T001, wait for T002
+-- Thread B: lock T002, wait for T001  ← deadlock: both wait forever
 
--- PATTERN 2: SELECT FOR UPDATE — pessimistic locking
-BEGIN;
+-- ─── PATTERN 2: Pessimistic locking ─────────────────────────────────────
+
+-- [SQLite] — BEGIN IMMEDIATE acquires write lock at transaction start
+BEGIN IMMEDIATE;
   SELECT net_qty, avg_price
   FROM positions
-  WHERE trader_id = 'T001' AND symbol = 'AAPL'
-  FOR UPDATE;         -- locks this row until COMMIT/ROLLBACK
-  
+  WHERE trader_id = 'T001' AND symbol = 'AAPL';
+
   UPDATE positions
-  SET net_qty   = net_qty + 100,
-      updated_at = NOW()
+  SET net_qty    = net_qty + 100,
+      updated_at = datetime('now')
   WHERE trader_id = 'T001' AND symbol = 'AAPL';
 COMMIT;
 
--- PATTERN 3: Upsert (insert or update atomically)
+-- [PostgreSQL only] — SELECT FOR UPDATE locks the row until COMMIT/ROLLBACK
+-- FOR UPDATE does not exist in SQLite
+-- BEGIN;
+--   SELECT net_qty, avg_price
+--   FROM positions
+--   WHERE trader_id = 'T001' AND symbol = 'AAPL'
+--   FOR UPDATE;
+--
+--   UPDATE positions
+--   SET net_qty    = net_qty + 100,
+--       updated_at = NOW()
+--   WHERE trader_id = 'T001' AND symbol = 'AAPL';
+-- COMMIT;
+
+-- ─── PATTERN 3: Upsert (insert or update atomically) ────────────────────
+-- [SQLite] — uses datetime('now'), not NOW()
 INSERT INTO positions (trader_id, symbol, net_qty, avg_price, updated_at)
 VALUES ('T001', 'AAPL', 100, 185.50, datetime('now'))
 ON CONFLICT (trader_id, symbol) DO UPDATE
   SET net_qty    = positions.net_qty + 100,
       updated_at = datetime('now');
 
--- PATTERN 4: Detect long-running locks (PostgreSQL)
--- SELECT pid, query, state, wait_event_type, wait_event, now() - pg_stat_activity.query_start AS duration
+-- ─── PATTERN 4: Detect long-running locks ───────────────────────────────
+-- [PostgreSQL only] — pg_stat_activity does not exist in SQLite
+-- SELECT pid, query, state, wait_event_type, wait_event,
+--        now() - pg_stat_activity.query_start AS duration
 -- FROM pg_stat_activity
--- WHERE state != 'idle' AND query_start < now() - interval '30 seconds';
+-- WHERE state != 'idle'
+--   AND query_start < now() - interval '30 seconds';
 
--- PATTERN 5: Kill a blocking query (PostgreSQL)
--- SELECT pg_cancel_backend(pid);      -- graceful
+-- ─── PATTERN 5: Kill a blocking query ───────────────────────────────────
+-- [PostgreSQL only] — these functions do not exist in SQLite
+-- SELECT pg_cancel_backend(pid);      -- graceful stop
 -- SELECT pg_terminate_backend(pid);   -- force kill
 """)
     ok(f"Locking notes: {deadlock_notes}")
