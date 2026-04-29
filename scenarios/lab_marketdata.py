@@ -381,7 +381,7 @@ with h5py.File(HDF5_FILE, "r") as f:
     def show_tree(name, obj):
         indent = "  " * name.count("/")
         kind = "GROUP" if isinstance(obj, h5py.Group) else f"DATASET shape={{obj.shape}}"
-        print(f"  {{indent}}{{name.split('/')[-1]}}  [{kind}]")
+        print(f"  {{indent}}{{name.split('/')[-1]}}  [{{kind}}]")
     f.visititems(show_tree)
 
 print("\\n=== AAPL Tick Analysis ===")
