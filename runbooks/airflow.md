@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers Apache Airflow DAG failures, SLA misses, sensor blocks, and backfill operations in a trading data pipeline context. All scenarios map to `lab_airflow.py` (AF-01 through AF-05).
+This runbook covers Apache Airflow DAG failures, SLA misses, sensor blocks, backfill operations, and market data pipeline orchestration for trading infrastructure. All scenarios map to `lab_airflow.py` (AF-01 through AF-10).
 
 ---
 
@@ -331,3 +331,234 @@ with DAG(
 | Metadata database connectivity lost | Airflow fully down — escalate infra |
 | Backfill running longer than expected | Pause it; check downstream system impact before resuming |
 | SLA misses accumulating across all DAGs | Worker capacity issue — scale the worker fleet |
+
+---
+
+## AF-06 — Market Data Ingestion DAG
+
+Orchestrates the daily market data pipeline: feed handler → Kafka → tick storage → quality checks.
+
+```python
+# schedule_interval="15 16 * * 1-5"  — 16:15 EST weekdays (after market close)
+# SLA: timedelta(minutes=45)          — alert if not done by 17:00
+
+with DAG("market_data_ingestion", schedule_interval="15 16 * * 1-5", ...) as dag:
+
+    check_feed_handler    = BashOperator(...)    # is feed handler alive?
+    validate_kafka_lag    = PythonOperator(...)  # lag < threshold on market-data.ticks
+    run_tick_storage      = BashOperator(...)    # consume Kafka → write HDF5
+    run_quality_checks    = PythonOperator(...)  # gaps, crossed books, symbol coverage
+    update_replay_index   = PythonOperator(...)  # update JSON index for replay website
+    check_symbol_coverage = PythonOperator(...)  # alert if any symbol missing
+
+    check_feed_handler >> validate_kafka_lag >> run_tick_storage
+    run_tick_storage >> [run_quality_checks, update_replay_index]
+    run_quality_checks >> check_symbol_coverage
+```
+
+### SLA configuration
+
+```python
+from datetime import timedelta
+
+default_args = {
+    'sla': timedelta(minutes=45),   # alert if task hasn't finished in 45 min
+}
+
+# SLA miss callback — fires when a task exceeds its SLA
+def sla_miss_callback(dag, task_list, blocking_task_list, slas, blocking_tis):
+    send_alert(f"SLA MISS: {[t.task_id for t in task_list]}")
+```
+
+---
+
+## AF-07 — Historical Tick Replay DAG
+
+On-demand DAG triggered by the data replay website. Users search for a symbol and date range; the website triggers this DAG and polls for completion.
+
+```python
+# schedule_interval=None   — triggered by external call only, never on schedule
+# max_active_runs=10        — allow up to 10 concurrent user requests
+
+with DAG("tick_replay", schedule_interval=None, max_active_runs=10, ...) as dag:
+
+    validate_request = ShortCircuitOperator(
+        task_id="validate_request",
+        python_callable=validate_replay_request,
+        # Returns False if: invalid date range, symbol not found in index, future date
+        # ShortCircuitOperator skips all downstream tasks on False — no error
+    )
+
+    determine_storage_tier = PythonOperator(...)
+    # HOT  (< 90 days):  read directly from HDF5 on local disk — milliseconds
+    # WARM (90d–2yr):    restore from S3 — seconds
+    # COLD (2yr–10yr):  restore from S3 Glacier — minutes to hours
+
+    fetch_data    = PythonOperator(...)   # fetch from appropriate tier
+    validate_data = PythonOperator(...)   # check quality, flag DEGRADED if gaps
+    serve_replay  = PythonOperator(...)   # write to temp location, notify website
+
+    validate_request >> determine_storage_tier >> fetch_data >> validate_data >> serve_replay
+```
+
+### Triggering from external systems
+
+```python
+# Website backend triggers Airflow via REST API:
+import requests
+response = requests.post(
+    "http://airflow:8080/api/v1/dags/tick_replay/dagRuns",
+    json={"conf": {"symbol": "AAPL", "start_date": "2024-01-01", "end_date": "2024-01-31"}},
+    auth=("airflow", "password"),
+)
+dag_run_id = response.json()["dag_run_id"]
+# Website polls GET /api/v1/dags/tick_replay/dagRuns/{dag_run_id} until state=success
+```
+
+---
+
+## AF-08 — EOD Risk Report DAG
+
+Runs at 17:00 EST weekdays. Depends on market_data_ingestion completing first — uses ExternalTaskSensor to wait.
+
+```python
+with DAG("eod_risk_report", schedule_interval="0 17 * * 1-5", ...) as dag:
+
+    wait_for_market_data = ExternalTaskSensor(
+        task_id="wait_for_market_data",
+        external_dag_id="market_data_ingestion",
+        external_task_id=None,          # wait for the entire DAG (not a specific task)
+        execution_delta=timedelta(minutes=45),   # market_data_ingestion runs at 16:15
+        # execution_delta: current DAG runs at 17:00, sensor looks for market_data_ingestion
+        # that ran at 17:00 - 45min = 16:15. Without this, sensor looks for a 17:00 run
+        # that doesn't exist and waits forever.
+        mode="reschedule",              # release the worker slot while waiting
+        timeout=3600,                   # fail after 1 hour
+    )
+
+    calculate_var       = PythonOperator(...)   # Value at Risk calculation
+    check_position_limits = PythonOperator(...) # flag limit breaches
+
+    generate_report     = PythonOperator(...)
+    send_report         = EmailOperator(...)
+
+    wait_for_market_data >> [calculate_var, check_position_limits]
+    [calculate_var, check_position_limits] >> generate_report >> send_report
+```
+
+### ExternalTaskSensor: execution_delta trap
+
+```
+Common mistake: omitting execution_delta when two DAGs have different schedules.
+
+market_data_ingestion runs at 16:15
+eod_risk_report       runs at 17:00
+
+Without execution_delta, ExternalTaskSensor looks for a market_data_ingestion
+run with execution_date = 17:00. No such run exists → sensor waits forever.
+
+With execution_delta=timedelta(minutes=45):
+Sensor looks for run at 17:00 - 45min = 16:15. Correct.
+```
+
+---
+
+## AF-09 — Regulatory Reporting Pipeline
+
+Runs T+1 (next morning) to report previous day's trading activity to regulators.
+
+```python
+# schedule_interval="0 5 * * 2-6"  — 05:00 Tuesday-Saturday (covers Mon-Fri trading)
+# retries=3, email_on_retry=True    — regulatory deadlines require reliable delivery
+
+default_args = {
+    'retries': 3,
+    'retry_delay': timedelta(minutes=10),
+    'email_on_retry': True,
+    'email_on_failure': True,
+}
+
+with DAG("regulatory_reporting", schedule_interval="0 5 * * 2-6", ...) as dag:
+
+    validate_trade_data = PythonOperator(...)     # check completeness of T-1 data
+
+    # Run all three regulatory submissions in parallel
+    format_finra   = PythonOperator(...)    # FINRA trade reporting
+    format_sec_cat = PythonOperator(...)    # SEC CAT (Consolidated Audit Trail)
+    format_cftc    = PythonOperator(...)    # CFTC swaps reporting
+
+    validate_trade_data >> [format_finra, format_sec_cat, format_cftc]
+
+    confirm_acks   = PythonOperator(...)    # wait for regulator acknowledgements
+    archive        = PythonOperator(...)    # archive to S3 (7-year retention, SEC Rule 17a-4)
+
+    [format_finra, format_sec_cat, format_cftc] >> confirm_acks >> archive
+```
+
+### Idempotent regulatory submissions
+
+```python
+# Use {{ ds }} (execution date) not datetime.now() — ensures backfills work correctly
+def format_finra_report(**context):
+    trade_date = context['ds']   # '2026-05-01' — the date being reported
+    # NOT: datetime.now().date() — that would report today's data on a backfill run
+
+# Use UPSERT to avoid duplicate submissions on retry
+cursor.execute("""
+    INSERT INTO submission_log (submission_id, trade_date, regulator, status, submitted_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (submission_id) DO UPDATE SET status = excluded.status
+""", (submission_id, trade_date, "FINRA", "SUBMITTED", datetime.utcnow()))
+```
+
+---
+
+## AF-10 — Airflow Best Practices
+
+### Always use `{{ ds }}` for task dates
+
+```python
+# WRONG — breaks on backfill, uses today's date instead of execution date
+def wrong_task(**context):
+    today = datetime.now().date()   # always "today" — incorrect on backfill
+
+# RIGHT — uses the DAG's logical execution date
+def correct_task(**context):
+    trade_date = context['ds']      # '2026-05-01' — the scheduled execution date
+    # Or: context['execution_date'] for a datetime object
+```
+
+### Use mode=reschedule on sensors
+
+```python
+# WRONG — poke mode holds a worker slot while waiting (starves other tasks)
+ExternalTaskSensor(mode="poke", poke_interval=30)
+
+# RIGHT — releases the worker slot between checks
+ExternalTaskSensor(mode="reschedule", poke_interval=60, timeout=3600)
+```
+
+### Idempotent DB writes — use UPSERT
+
+```python
+# WRONG — fails on retry with duplicate key, or inserts duplicates
+cursor.execute("INSERT INTO results VALUES (%s, %s)", (date, value))
+
+# RIGHT — safe to run multiple times
+cursor.execute("""
+    INSERT INTO results (trade_date, value)
+    VALUES (%s, %s)
+    ON CONFLICT (trade_date) DO UPDATE SET value = EXCLUDED.value
+""", (date, value))
+```
+
+### Anti-patterns to avoid
+
+| Anti-pattern | Problem | Fix |
+|---|---|---|
+| `datetime.now()` in tasks | Returns current time, not execution date — breaks backfills | Use `{{ ds }}` or `context['ds']` |
+| `enable_auto_commit=True` in consumers | Commits offset before processing — loses data on crash | Commit after write |
+| Sensor in `poke` mode | Holds worker slot indefinitely — starves other DAGs | Use `mode=reschedule` |
+| Re-running without idempotency | Inserts duplicates or fails with constraint violation | Use UPSERT / `INSERT ... ON CONFLICT` |
+| Catching bare `except Exception` | Hides failures, DAG shows success when task actually failed | Let exceptions propagate or re-raise |
+| Global variables for state | State not isolated across DAG runs | Use XCom or external storage |

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers SQL query writing, performance investigation, transaction management, and position reconciliation for trading databases. All scenarios map to `lab_sql.py` (S-01 through S-06).
+This runbook covers SQL query writing, performance investigation, transaction management, position reconciliation, and market data gap investigation for trading databases. All scenarios map to `lab_sql.py` (S-01 through S-08).
 
 The lab uses SQLite. Production trading systems typically run PostgreSQL. SQL syntax is compatible unless noted.
 
@@ -60,6 +60,20 @@ positions (
 -- Audit log
 orders_audit (audit_id INTEGER PK, trade_id INTEGER, action TEXT,
               action_time TEXT, actor TEXT, notes TEXT)
+```
+
+```sql
+-- Tick data (market data pipeline — added for S-07 and S-08)
+tick_data (
+  id       INTEGER PK,
+  symbol   TEXT,
+  ts       TEXT,       -- '2026-05-01 14:30:00'
+  price    REAL,
+  volume   INTEGER,
+  seq_num  INTEGER,    -- exchange sequence number (must be monotonically increasing)
+  feed     TEXT        -- 'PRIMARY' or 'SECONDARY'
+)
+-- Indexes: (symbol, ts) and (feed, symbol, ts)
 ```
 
 ---
@@ -409,6 +423,175 @@ SELECT pg_terminate_backend(<pid>);  -- force
 -- Look for: ERROR: deadlock detected
 -- DETAIL: Process X waits for ShareLock on transaction Y
 ```
+
+---
+
+---
+
+## S-07 — Market Data Gap Investigation
+
+Use these queries when a researcher reports missing data for a symbol or time window.
+
+### Step 1: Find symbols with zero ticks in the suspect window
+
+```sql
+-- Find symbols with no ticks in the 14:30-15:00 window (PRIMARY feed)
+SELECT   symbol,
+         COUNT(*) AS tick_count
+FROM     tick_data
+WHERE    feed = 'PRIMARY'
+  AND    ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+GROUP BY symbol
+ORDER BY tick_count ASC;
+
+-- Find symbols that have data elsewhere but NOTHING in this window
+SELECT DISTINCT symbol FROM tick_data WHERE feed = 'PRIMARY'
+EXCEPT
+SELECT symbol FROM tick_data
+WHERE  feed = 'PRIMARY'
+  AND  ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00';
+```
+
+### Step 2: Find the last good tick before the gap
+
+```sql
+-- When did the data stop? What was the last price?
+SELECT   symbol,
+         MAX(ts)      AS last_tick_before_gap,
+         MAX(price)   AS last_price,
+         MAX(seq_num) AS last_seq_num
+FROM     tick_data
+WHERE    feed   = 'PRIMARY'
+  AND    symbol = 'NVDA'
+  AND    ts     < '2026-05-01 14:30:00'
+GROUP BY symbol;
+-- Correlate this timestamp with Kafka lag logs / pod crash logs
+```
+
+### Step 3: Find sequence number gaps (dropped ticks)
+
+```sql
+-- LAG() window function detects jumps in seq_num
+WITH numbered AS (
+    SELECT symbol, feed, ts, seq_num,
+           LAG(seq_num) OVER (PARTITION BY symbol, feed ORDER BY seq_num) AS prev_seq
+    FROM   tick_data
+    WHERE  feed = 'PRIMARY'
+)
+SELECT symbol,
+       prev_seq          AS gap_starts_after,
+       seq_num           AS gap_ends_at,
+       (seq_num - prev_seq - 1) AS ticks_missing,
+       ts                AS resumed_at
+FROM   numbered
+WHERE  prev_seq IS NOT NULL
+  AND  (seq_num - prev_seq) > 1
+ORDER BY ticks_missing DESC;
+-- Gap in seq_num = packets dropped between exchange and storage
+```
+
+### Hourly tick count sanity check
+
+```sql
+SELECT   symbol,
+         feed,
+         SUBSTR(ts, 1, 13) AS hour,
+         COUNT(*)           AS tick_count
+FROM     tick_data
+WHERE    feed = 'PRIMARY'
+GROUP BY symbol, feed, hour
+ORDER BY symbol, hour;
+-- A zero for any hour = dead feed for that period
+```
+
+---
+
+## S-08 — Feed Completeness Cross-Check (Primary vs Secondary)
+
+Use when validating that both feeds captured the same data, or after a secondary feed incident.
+
+### Cross-feed coverage comparison
+
+```sql
+-- Find symbols where PRIMARY has ticks but SECONDARY is missing in the window
+SELECT   p.symbol,
+         COUNT(p.id)                    AS primary_ticks,
+         COALESCE(COUNT(s.id), 0)       AS secondary_ticks,
+         COUNT(p.id) - COALESCE(COUNT(s.id), 0) AS delta
+FROM     tick_data p
+LEFT JOIN tick_data s
+       ON s.symbol = p.symbol
+      AND s.ts     = p.ts
+      AND s.feed   = 'SECONDARY'
+WHERE    p.feed = 'PRIMARY'
+  AND    p.ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+GROUP BY p.symbol
+ORDER BY delta DESC;
+-- delta > 0 = PRIMARY has ticks that SECONDARY is missing
+```
+
+### Drill into missing minutes for a specific symbol
+
+```sql
+-- Find exact minute-bars missing on SECONDARY for MSFT
+SELECT   p.ts,
+         p.seq_num AS primary_seq,
+         s.seq_num AS secondary_seq    -- NULL if missing
+FROM     tick_data p
+LEFT JOIN tick_data s
+       ON s.symbol = p.symbol
+      AND s.ts     = p.ts
+      AND s.feed   = 'SECONDARY'
+WHERE    p.feed   = 'PRIMARY'
+  AND    p.symbol = 'MSFT'
+  AND    p.ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+  AND    s.id IS NULL
+ORDER BY p.ts;
+```
+
+### Sequence gap comparison across feeds
+
+```sql
+-- Gap on BOTH feeds = exchange/network issue (escalate to vendor)
+-- Gap on ONE feed only = that feed handler dropped packets (internal fix)
+WITH gaps AS (
+    SELECT feed, symbol, seq_num,
+           LAG(seq_num) OVER (PARTITION BY feed, symbol ORDER BY seq_num) AS prev_seq,
+           ts
+    FROM   tick_data WHERE symbol = 'TSLA'
+)
+SELECT feed, prev_seq AS gap_after_seq, seq_num AS gap_before_seq,
+       (seq_num - prev_seq - 1) AS missing_count
+FROM   gaps
+WHERE  prev_seq IS NOT NULL AND (seq_num - prev_seq) > 1
+ORDER BY feed, gap_after_seq;
+```
+
+### EOD completeness summary
+
+```sql
+-- Run at end of day to validate both feeds covered all symbols
+SELECT   symbol, feed,
+         COUNT(*)           AS total_ticks,
+         MIN(ts)            AS first_tick,
+         MAX(ts)            AS last_tick,
+         MAX(seq_num) - MIN(seq_num) + 1 AS expected_seq_range,
+         (MAX(seq_num) - MIN(seq_num) + 1) - COUNT(*) AS seq_gaps
+FROM     tick_data
+GROUP BY symbol, feed
+ORDER BY symbol, feed;
+-- seq_gaps > 0 means dropped ticks
+```
+
+### Key patterns for market data SQL
+
+| Task | Pattern |
+|------|---------|
+| Find symbols with no data in window | `COUNT(*) GROUP BY symbol` + `EXCEPT` |
+| Last known good timestamp | `MAX(ts) WHERE ts < window_start` |
+| Sequence gaps | `LAG(seq_num) OVER (PARTITION BY symbol, feed ORDER BY seq_num)` |
+| Cross-feed comparison | `LEFT JOIN tick_data s ON s.symbol=p.symbol AND s.ts=p.ts AND s.feed='SECONDARY'` |
+| Gap on both feeds vs one | Run seq gap query per feed, compare results |
 
 ---
 

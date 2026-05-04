@@ -2,7 +2,11 @@
 
 ## Overview
 
-This runbook covers Kubernetes pod debugging, deployment issues, configuration problems, and ArgoCD sync failures in a trading environment. All scenarios map to `lab_k8s.py` (K8-01 through K8-06).
+This runbook covers Kubernetes pod debugging, deployment issues, ArgoCD sync failures, and Argo Workflows data pipeline operations in a trading environment. All scenarios map to `lab_k8s.py` (K8-01 through K8-09).
+
+> **ArgoCD vs Argo Workflows** — both are from the Argo project but are completely different tools.
+> - **ArgoCD** = GitOps continuous delivery — keeps K8s apps in sync with a Git repository (K8-04/K8-05/K8-06)
+> - **Argo Workflows** = job orchestration — runs DAG-style pipeline jobs as Kubernetes pods, like a K8s-native Airflow (K8-07/K8-08/K8-09)
 
 Check out the training slides for more detailed info on Kubernetes: [Google Slides Link](https://docs.google.com/presentation/d/17WSNZt3aqfCereHa1yZXs30Y6SsymtKkJxSkySL8-Yg/edit?usp=sharing)
 
@@ -365,6 +369,194 @@ argocd app wait <app-name> --health
 
 ---
 
+---
+
+## K8-07 — Argo Workflows: OOMKilled Step
+
+### Symptoms
+- Argo Workflow in `Failed` state after running longer than expected
+- Step shows `Error (exit code 137)`
+- Researcher or downstream job reports missing data for a time window
+
+### Diagnosis
+
+```bash
+# 1. Get workflow overview — which step failed and why
+argo get <workflow-name> -n <namespace>
+# Look for: exit code in MESSAGE column, ✖ on the failing step
+
+# 2. Read the failed step's logs
+argo logs <workflow-name> <step-name> -n <namespace>
+# Look for: "Killed" at the end — exit 137 = OOMKilled
+
+# 3. Confirm OOMKilled at the pod level
+kubectl describe pod <workflow-pod-name> -n <namespace>
+# Look for: Reason: OOMKilled  and  Limits: memory: Xgi
+
+# 4. Check recent memory growth in pod logs
+argo logs <workflow-name> <step-name> -n <namespace> | grep -i "memory\|mem\|heap"
+```
+
+### Exit Code Reference
+
+| Exit Code | Meaning |
+|-----------|---------|
+| 137 | SIGKILL — OOMKilled by kernel (`128 + 9`) |
+| 1 | Application error — check logs |
+| 126 | Permission denied |
+| 127 | Command not found |
+| 143 | SIGTERM — graceful shutdown (`128 + 15`) |
+
+### Resolution
+
+```bash
+# Fix: increase memory limit in the workflow YAML template
+# Find the failing step's template and update:
+#   resources:
+#     limits:
+#       memory: "1Gi"   →   memory: "4Gi"
+#     requests:
+#       memory: "512Mi" →   memory: "2Gi"
+
+# Then retry from the failed step only — reuse completed steps
+argo retry <workflow-name> -n <namespace> --restart-successful
+
+# Do NOT use argo resubmit — that starts from scratch (wastes time on completed steps)
+```
+
+---
+
+## K8-08 — Argo Workflows: Retry vs Resubmit
+
+### When to use each
+
+| Command | What it does | Use when |
+|---------|-------------|----------|
+| `argo retry <wf> --restart-successful` | Reuses output from passed steps, reruns only failed step | Error was transient (disk full, OOM) and prior step output is still valid |
+| `argo resubmit <wf>` | Creates a brand new workflow, starts from scratch | Prior step output is corrupted, or you need different parameters |
+| `argo submit --from=wf/<name>` | Submit a new run using same parameters | Same as resubmit but cleaner for template-based workflows |
+
+### Diagnosis
+
+```bash
+# See the partial workflow state — which steps completed vs failed
+argo get <workflow-name> -n <namespace>
+
+# Read the error from the failed step
+argo logs <workflow-name> <failed-step> -n <namespace>
+
+# Identify if the failure is transient (infra) or logic (code)
+# Transient: disk full, OOMKilled, network timeout → retry
+# Logic: AssertionError, KeyError, bad data → fix code, then resubmit
+```
+
+### Retry workflow
+
+```bash
+# Resume from failed step — skips completed steps
+argo retry <workflow-name> -n <namespace> --restart-successful
+
+# Watch the retried workflow
+argo watch <workflow-name> -n <namespace>
+
+# Confirm all steps pass
+argo get <workflow-name> -n <namespace>
+```
+
+---
+
+## K8-09 — Argo Workflows: CronWorkflow Missed Schedule
+
+### Symptoms
+- Researcher reports data is missing for a specific date
+- `argo list` shows no run for the expected schedule time
+- CronWorkflow is not suspended but no execution occurred
+
+### Diagnosis
+
+```bash
+# 1. List recent runs for the CronWorkflow
+argo list -n <namespace> --prefix <cronworkflow-name>
+# Look for: gap in the schedule (a date missing from the run history)
+
+# 2. Inspect the CronWorkflow configuration
+argo cron get <cronworkflow-name> -n <namespace>
+# Key fields to check:
+#   Schedule          — is it correct? Is timezone set?
+#   Suspend           — false or true?
+#   ConcurrencyPolicy — Forbid / Allow / Replace
+#   LastScheduledTime — when did it last fire?
+#   Active Workflows  — Forbid policy treats stuck workflows as "active"
+
+# 3. If concurrencyPolicy=Forbid, check if a previous run is stuck
+argo list -n <namespace> --prefix <cronworkflow-name> --running
+# A workflow stuck in Running or Failed state under Forbid policy blocks next schedule
+```
+
+### Common Causes
+
+| Cause | Symptom | Fix |
+|-------|---------|-----|
+| `concurrencyPolicy: Forbid` + previous run stuck in Failed | No new run triggered | Delete the stuck workflow: `argo delete <old-wf> -n <ns>` |
+| `suspend: true` | All schedules skipped | `argo cron resume <cronwf-name> -n <ns>` |
+| Timezone mismatch | Runs at wrong time or skipped DST | Set `timezone: America/Chicago` in CronWorkflow spec |
+| `startingDeadlineSeconds` too short | Schedule fires but misses the window | Increase to 3600 (1 hour) |
+| No worker nodes at schedule time | Workflow triggered but pod stuck Pending | Check cluster autoscaler / node availability |
+
+### Manual Re-trigger
+
+```bash
+# Manually submit for a missed date
+argo submit -n <namespace> \
+  --from=cronwf/<cronworkflow-name> \
+  --parameter date=2026-05-01 \
+  --labels "triggered-by=manual-backfill,reason=missed-schedule"
+
+# Watch the manually submitted run
+argo watch @latest -n <namespace>
+```
+
+### ConcurrencyPolicy Options
+
+```yaml
+# In CronWorkflow spec:
+concurrencyPolicy: Forbid    # skip new run if previous still active — can miss schedules!
+concurrencyPolicy: Allow     # run multiple concurrently — risk of resource contention
+concurrencyPolicy: Replace   # cancel previous, start fresh — usually safest for pipelines
+```
+
+---
+
+## Argo Workflows Cheat Sheet
+
+```bash
+# Workflow operations
+argo list -n <ns>                                    # list all workflows
+argo list -n <ns> --prefix <name>                    # filter by name prefix
+argo get <workflow> -n <ns>                          # workflow + step status
+argo logs <workflow> <step> -n <ns>                  # step pod logs
+argo watch <workflow> -n <ns>                        # stream status updates
+argo delete <workflow> -n <ns>                       # clean up workflow
+
+# Retry / resubmit
+argo retry <workflow> -n <ns> --restart-successful   # resume from failed step
+argo resubmit <workflow> -n <ns>                     # start from scratch
+
+# CronWorkflow operations
+argo cron list -n <ns>                               # list cron workflows
+argo cron get <name> -n <ns>                         # cron status + last run
+argo cron suspend <name> -n <ns>                     # pause the schedule
+argo cron resume <name> -n <ns>                      # unpause the schedule
+argo submit -n <ns> --from=cronwf/<name>             # manual trigger
+
+# Useful kubectl for Argo pods
+kubectl get pods -n <ns> -l workflows.argoproj.io/workflow=<wf>   # pods for a workflow
+kubectl logs <wf-pod> -n <ns>                                      # raw pod logs
+kubectl describe pod <wf-pod> -n <ns>                              # OOMKilled events
+```
+
+---
+
 ## Essential kubectl Cheat Sheet
 
 ```bash
@@ -407,3 +599,4 @@ kubectl describe node <node>
 | PersistentVolume lost or corrupted | Escalate — potential data loss |
 | CrashLoopBackOff after rollback | Escalate to dev — code issue not deployment issue |
 | ArgoCD controller unresponsive | Restart ArgoCD controller pod in argocd namespace |
+| Argo Workflow OOMKilled repeatedly on same step | Permanent memory issue — increase limits in workflow template or investigate memory leak |

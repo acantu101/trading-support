@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers Kafka operational issues in a trading environment: consumer group lag, broker failures, partition management, and producer configuration. All scenarios map to `lab_kafka.py` (K-01 through K-06).
+This runbook covers Kafka operational issues in a trading environment: consumer group lag, broker failures, partition management, producer configuration, and market data pipeline operations. All scenarios map to `lab_kafka.py` (K-01 through K-12).
 
 ---
 
@@ -297,6 +297,270 @@ consumer = KafkaConsumer(
 
 ### In practice
 Idempotent producer (`enable_idempotence=True`) + manual consumer offset commit covers 90% of trading use cases. Full transactions only needed for consume-transform-produce pipelines where you must atomically advance the consumer offset and produce the result.
+
+---
+
+---
+
+## K-07 — Market Data Feed Handler → Kafka Pipeline
+
+The feed handler is the bridge between raw UDP multicast ticks from the exchange and the internal Kafka topic that downstream consumers read from.
+
+```
+UDP Multicast (exchange)
+     ↓  raw pipe-delimited ticks
+Feed Handler (validates, normalizes, partitions by symbol)
+     ↓
+Kafka topic: market-data.ticks (24 partitions, 1hr retention, lz4 compression)
+     ↓  consumers subscribe in parallel
+┌─────────────────────────────────────────┐
+│ risk-engine-group  (real-time MTM)      │
+│ algo-trading-group (signal generation)  │
+│ tick-storage-group (HDF5 / TimescaleDB) │
+│ vwap-calc-group    (streaming VWAP)     │
+└─────────────────────────────────────────┘
+```
+
+### Market data topic configuration
+
+```bash
+# market-data.ticks topic settings (production)
+partitions=24              # 24 symbols → 1 partition per major symbol
+replication-factor=3       # standard HA
+retention.ms=3600000       # 1 hour — ticks flow to HDF5, no long-term Kafka retention
+compression.type=lz4       # fast compression for high-throughput tick data
+```
+
+### Validation before publishing
+
+```python
+# Feed handler must validate before publishing to main topic
+# Invalid ticks → dead letter queue (market-data.ticks.dlq)
+
+def validate(tick):
+    if not all(k in tick for k in ['symbol', 'bid', 'ask', 'exchange']):
+        return "MISSING_FIELDS"
+    if tick['symbol'] not in VALID_SYMBOLS:
+        return f"UNKNOWN_SYMBOL:{tick['symbol']}"
+    if tick['bid'] < 0 or tick['ask'] < 0:
+        return "NEGATIVE_PRICE"
+    if tick['bid'] >= tick['ask']:
+        return "CROSSED_BOOK"
+    return None   # valid
+```
+
+### Symbol partitioning
+
+```python
+# Partition by symbol — all ticks for a symbol land on the same partition
+# This guarantees ordering of bid/ask updates per symbol
+partition = abs(hash(symbol)) % num_partitions
+```
+
+---
+
+## K-08 — Market Data Consumer Lag at Market Open
+
+At 09:30 market open, tick rate spikes 10x. If tick-storage-group consumers can't keep up, downstream HDF5 writes fall behind — researchers get stale data.
+
+### Reading the lag output
+
+```
+GROUP               TOPIC              PARTITION  LAG    CONSUMER-ID
+tick-storage-group  market-data.ticks  0          50     tick-1-a1b2    ← OK
+tick-storage-group  market-data.ticks  1          10500  tick-1-a1b2    ← HIGH LAG
+tick-storage-group  market-data.ticks  5          10500  -              ← NO CONSUMER
+```
+
+A `CONSUMER-ID` of `-` means no consumer is assigned to that partition — the pod died or the group is under-provisioned.
+
+### Staleness calculation
+
+```python
+# If tick rate = 200 msg/sec and lag = 10,500 messages:
+stale_seconds = lag / tick_rate = 10500 / 200 = 52.5 seconds
+# Downstream systems (risk engine, VWAP) are 52 seconds behind real-time
+```
+
+### Resolution
+
+```bash
+# Scale consumer group — add instances to cover unassigned partitions
+# Rule: consumer instances ≤ partition count (extras sit idle)
+# For 24 partitions: run 24 consumer instances for full coverage
+
+# If consumers are too slow (lag stable but high):
+# max.poll.records=100   # reduce batch size → faster commit cycle
+# Optimize the HDF5 write path (batch writes, async flush)
+```
+
+---
+
+## K-09 — Kafka → Tick Storage Pipeline
+
+### Commit-after-write pattern (critical)
+
+```python
+for msg in consumer:
+    tick = msg.value
+
+    # 1. Validate the tick
+    if not is_valid(tick): route_to_dlq(tick); continue
+
+    # 2. Transform (normalize timestamps, add fields)
+    normalized = normalize(tick)
+
+    # 3. Write to HDF5 / database FIRST
+    writer.writerow(normalized)
+
+    # 4. THEN commit the Kafka offset
+    consumer.commit()   # ← always AFTER the write, never before
+
+# Why commit-after-write:
+# If we commit first and then crash, the tick is lost (offset advanced, not written)
+# If we write first and then crash, we re-read and write again — idempotent duplicate
+# Duplicates are recoverable; lost data is not
+```
+
+---
+
+## K-10 — Streaming VWAP Pipeline
+
+VWAP (Volume-Weighted Average Price) must be computed in real time as ticks arrive.
+
+```python
+# Stateful VWAP accumulator per symbol
+total_notional = defaultdict(float)   # symbol → Σ(price × volume)
+total_volume   = defaultdict(float)   # symbol → Σ(volume)
+
+for msg in consumer:
+    tick = msg.value
+    sym, px, qty = tick['symbol'], tick['price'], tick['volume']
+
+    total_notional[sym] += px * qty
+    total_volume[sym]   += qty
+
+    vwap = round(total_notional[sym] / total_volume[sym], 4)
+    publish_vwap(sym, vwap)
+    consumer.commit()
+
+# VWAP resets at market open each day (clear accumulators at 09:30)
+# State must survive consumer restarts → persist to Redis or TimescaleDB
+```
+
+---
+
+## K-11 — Dead Letter Queue (DLQ) Pattern
+
+```
+market-data.ticks (main topic, 1hr retention)
+     ↓
+Feed handler validates each message
+     ↓
+Valid   → publish normally → downstream consumers
+Invalid → market-data.ticks.dlq (30-day retention, 3 partitions)
+```
+
+### DLQ topic configuration
+
+```bash
+kafka-topics.sh --bootstrap-server $BROKER \
+  --create --topic market-data.ticks.dlq \
+  --partitions 3 \
+  --replication-factor 3 \
+  --config retention.ms=2592000000   # 30 days — long retention for investigation
+```
+
+### Monitor DLQ volume
+
+```bash
+# DLQ lag growing = systematic data quality issue upstream
+kafka-consumer-groups.sh --bootstrap-server $BROKER \
+  --group dlq-monitor-group \
+  --describe | grep market-data.ticks.dlq
+
+# Alert if DLQ rate > 1% of main topic volume
+```
+
+### Replay from DLQ after fix
+
+```bash
+# After fixing the root cause, replay bad messages through the corrected handler
+kafka-console-consumer.sh --bootstrap-server $BROKER \
+  --topic market-data.ticks.dlq \
+  --from-beginning \
+  | python3 fixed_handler.py \
+  | kafka-console-producer.sh --bootstrap-server $BROKER \
+    --topic market-data.ticks
+```
+
+---
+
+## K-12 — End-to-End Pipeline Triage
+
+This is the full L1→L2→dev escalation workflow for a data pipeline support ticket.
+
+### Triage sequence
+
+```
+1. Read the ticket carefully
+   → What is the exact symptom? Which symbols? What time window?
+
+2. Check HDF5 metadata for the affected file
+   → h5ls -r /data/ticks/<date>.h5
+   → Look for: last_ts cutoff earlier than expected
+   → If multiple symbols cut off at the SAME timestamp = pipeline crash (not data quality)
+
+3. Check Kafka consumer lag at the time of the incident
+   → kafka-consumer-groups.sh ... --describe
+   → CONSUMER-ID = "-" on all partitions = pod died at that moment
+
+4. Check Kubernetes pod logs for the tick storage job
+   → kubectl logs <pod> -n data-pipelines --previous
+   → Look for: "Killed" and exit code 137 (OOMKilled)
+   → kubectl describe pod → confirms Reason: OOMKilled + memory limit
+
+5. Check Kafka retention — is the data still available for replay?
+   → market-data.ticks retention = 1 hour
+   → If incident was recent, data is still in Kafka → replay is possible
+   → Flag as URGENT if replay window is closing
+
+6. Write the L2 escalation (before calling dev)
+```
+
+### L2 escalation checklist
+
+```markdown
+## Required fields in L2 escalation note
+
+- [ ] Affected symbols and exact time window (from HDF5 metadata)
+- [ ] Root cause (OOMKilled / pod crash / Kafka lag — with evidence)
+- [ ] Evidence: log snippet, kubectl describe output, HDF5 metadata
+- [ ] What was already ruled out (user error, exchange issue, network)
+- [ ] Kafka replay window — is data still available? How long until expiry?
+- [ ] Recommended action for dev team
+- [ ] Impact: who is affected (research, risk, downstream jobs)
+```
+
+### Key diagnostic commands
+
+```bash
+# HDF5 file metadata — check last_ts per symbol
+h5ls -r /data/ticks/<date>.h5
+
+# Kafka consumer lag snapshot
+kafka-consumer-groups.sh \
+  --bootstrap-server $BROKER \
+  --group tick-storage-group \
+  --describe
+
+# Pod logs from crashed container
+kubectl logs <pod-name> -n data-pipelines --previous
+
+# OOMKilled confirmation
+kubectl describe pod <pod-name> -n data-pipelines \
+  | grep -A5 "Last State\|Limits\|Reason"
+```
 
 ---
 

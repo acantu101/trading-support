@@ -33,15 +33,15 @@ A self-contained Linux lab environment that simulates real trading infrastructur
 | `scenarios/lab_linux.py` | Linux & Systems scenarios (L-01 to L-10) |
 | `scenarios/lab_networking.py` | Networking scenarios (N-01 to N-05) |
 | `scenarios/lab_fix.py` | FIX Protocol scenarios (FX-01 to FX-06) |
-| `scenarios/lab_kafka.py` | Kafka scenarios (K-01 to K-06) |
-| `scenarios/lab_k8s.py` | Kubernetes & ArgoCD scenarios (K8-01 to K8-06) |
-| `scenarios/lab_sql.py` | SQL & Databases scenarios (S-01 to S-06) |
+| `scenarios/lab_kafka.py` | Kafka scenarios (K-01 to K-12) |
+| `scenarios/lab_k8s.py` | Kubernetes, ArgoCD & Argo Workflows (K8-01 to K8-09) |
+| `scenarios/lab_sql.py` | SQL & Databases scenarios (S-01 to S-08) |
 | `scenarios/lab_git.py` | Git scenarios (G-01 to G-05) |
-| `scenarios/lab_airflow.py` | Airflow scenarios (AF-01 to AF-05) |
+| `scenarios/lab_airflow.py` | Airflow scenarios (AF-01 to AF-10) |
 | `scenarios/lab_python.py` | Python & Bash scripting + OOP scenarios (P-01 to P-08) |
 | `scenarios/lab_aws.py` | AWS & Cloud scenarios (A-01 to A-05) |
 | `scenarios/lab_java.py` | Java / JVM scenarios (J-01 to J-04) |
-| `scenarios/lab_marketdata.py` | Market Data & Protocols scenarios (MD-01 to MD-05) |
+| `scenarios/lab_marketdata.py` | Market Data & Protocols scenarios (MD-01 to MD-14) |
 | `scenarios/lab_monitoring.py` | Monitoring & Observability scenarios (M-01 to M-05) |
 
 ---
@@ -142,7 +142,7 @@ python3 lab.py
     networking   N   Networking
     fix          F   FIX Protocol
     kafka        K   Kafka
-    k8s          K8  Kubernetes & ArgoCD
+    k8s          K8  Kubernetes, ArgoCD & Argo Workflows
     sql          S   SQL & Databases
     git          G   Git
     airflow      AF  Airflow
@@ -220,21 +220,30 @@ Spawns real broken processes on your VM to practice with actual Linux tools.
 | K-04 | Broker down incident — crash log + response guide |
 | K-05 | Python producer + consumer scripts |
 | K-06 | At-least-once vs exactly-once delivery semantics |
+| K-07 | Market data feed handler → Kafka pipeline |
+| K-08 | Market data consumer lag at market open |
+| K-09 | Data pipeline — Kafka → tick storage (commit-after-write) |
+| K-10 | Streaming VWAP pipeline (consume-transform-produce) |
+| K-11 | Dead letter queue pattern — validate, route, quarantine |
+| K-12 | End-to-end pipeline triage — researcher ticket → root cause → L2 escalation |
 
-### Kubernetes & ArgoCD (`lab_k8s.py`)
+### Kubernetes, ArgoCD & Argo Workflows (`lab_k8s.py`)
 
 | # | Scenario |
 |---|----------|
-| K8-01 | CrashLoopBackOff — read logs and fix |
-| K8-02 | Pod stuck in Pending — resource/node investigation |
-| K8-03 | Failed rolling deployment — rollback procedure |
-| K8-04 | ConfigMap and Secret misconfiguration |
-| K8-05 | Service not routing traffic — selector mismatch |
-| K8-06 | ArgoCD sync failure — drift detection |
+| K8-01 | CrashLoopBackOff — pod logs, exit codes, missing secrets |
+| K8-02 | Rolling deployment rollback — manifests + rollout history |
+| K8-03 | Pod stuck Pending / ImagePullBackOff — scheduling diagnosis |
+| K8-04 | ArgoCD rollback + disable auto-sync — selfHeal trap |
+| K8-05 | Validate release before prod sync — dry-run, diff, go/no-go |
+| K8-06 | Behavioral — K8s story with metrics and process |
+| K8-07 | Argo Workflows — OOMKilled step (exit 137, argo get, retry) |
+| K8-08 | Argo Workflows — retry failed step vs full resubmit |
+| K8-09 | Argo Workflows — CronWorkflow missed schedule, manual re-trigger |
 
 ### SQL & Databases (`lab_sql.py`)
 
-Creates a SQLite trading database (`/tmp/lab_sql/db/trading.db`) with traders, trades, positions, and orders_audit tables.
+Creates a SQLite trading database (`/tmp/lab_sql/db/trading.db`) with traders, trades, positions, orders_audit, and tick_data tables.
 
 | # | Scenario |
 |---|----------|
@@ -244,6 +253,8 @@ Creates a SQLite trading database (`/tmp/lab_sql/db/trading.db`) with traders, t
 | S-04 | Trader leaderboard — window functions (RANK, PARTITION BY) |
 | S-05 | Slow query investigation — EXPLAIN + index creation |
 | S-06 | Concurrent writes and locking — transactions + deadlock notes |
+| S-07 | Market data gap investigation — zero-tick windows, LAG() sequence gaps |
+| S-08 | Feed completeness cross-check — LEFT JOIN primary vs secondary feed |
 
 ### Git (`lab_git.py`)
 
@@ -259,11 +270,16 @@ Creates a SQLite trading database (`/tmp/lab_sql/db/trading.db`) with traders, t
 
 | # | Scenario |
 |---|----------|
-| AF-01 | Debug a failed DAG — task logs + retry logic |
-| AF-02 | SLA miss investigation |
-| AF-03 | Sensor stuck blocking downstream tasks |
-| AF-04 | Backfill a missed execution window |
-| AF-05 | DAG dependency and trigger rule analysis |
+| AF-01 | Debug a failed DAG — task logs + error analysis |
+| AF-02 | SLA miss investigation — slow task + monitoring script |
+| AF-03 | Pipeline health check — mock Airflow REST API + script |
+| AF-04 | Sensor task never triggering — ExternalTaskSensor diagnosis |
+| AF-05 | Behavioral — tell your Airflow / pipeline story |
+| AF-06 | Market data ingestion DAG — feed handler → Kafka → HDF5, SLA 45 min |
+| AF-07 | Historical tick replay DAG — on-demand (website trigger), 3-tier storage |
+| AF-08 | EOD risk report DAG — ExternalTaskSensor + execution_delta, parallel VaR |
+| AF-09 | Regulatory reporting pipeline — FINRA/SEC/CFTC, T+1, 7-year archive |
+| AF-10 | Airflow best practices — idempotency, reschedule sensors, anti-patterns |
 
 ### Python & Bash (`lab_python.py`)
 
@@ -306,6 +322,15 @@ Creates a SQLite trading database (`/tmp/lab_sql/db/trading.db`) with traders, t
 | MD-03 | HDF5 tick storage — read/write with h5py, VWAP calculation, columnar access |
 | MD-04 | Feed handler gap detection — sequence number gaps, recovery procedure |
 | MD-05 | SBE binary encoding — decode little-endian CME-style market data messages |
+| MD-06 | Live UDP multicast — receive from primary/secondary feed, arbitrate |
+| MD-07 | Sequence gap detection — live gap at SEQ 7-10, stale flag, recovery |
+| MD-08 | NIC buffer tuning — `rmem_max`, `SO_RCVBUF`, heartbeat timeout |
+| MD-09 | Feed latency measurement — exchange timestamp vs receipt, jitter spikes |
+| MD-10 | IGMP multicast membership — group join, membership query |
+| MD-11 | Order book invalidation — gap marks book STALE, stops pricing |
+| MD-12 | Snapshot + incremental recovery — JSON snapshot at SEQ=50, apply deltas |
+| MD-13 | Crossed book detection — bid > ask at SEQ 4, alert fires |
+| MD-14 | Market impact / slippage — 4500-share BUY walks 3 ask levels, basis points |
 
 ### Monitoring & Observability (`lab_monitoring.py`)
 
@@ -462,6 +487,9 @@ Each directory contains:
 - For monitoring: you know why p99 matters more than average for trading latency
 - For market data: you can explain why a sequence gap requires halting trading on that symbol
 - For AWS: you can triage an IAM AccessDenied from logs before touching the console
+  - For Argo Workflows: you can distinguish ArgoCD (GitOps CD) from Argo Workflows (job orchestration), and know when to use `argo retry --restart-successful` vs `argo resubmit`
+  - For market data SQL: you can write a `LAG(seq_num) OVER PARTITION BY` query to find sequence gaps, and a `LEFT JOIN` cross-feed completeness check
+  - For pipeline triage: you can connect a researcher ticket through Kafka lag → pod OOMKilled → HDF5 metadata cutoff and write a clear L2 escalation before touching a developer
 
 **Pro tip:** Run the full incident scenarios (scenario 99 in Linux, or `python3 lab.py --category linux` then pick 99) and practice triaging multiple faults in priority order. That structured thinking under pressure is exactly what production on-call looks like.
 

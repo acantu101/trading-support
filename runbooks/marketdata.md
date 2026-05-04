@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers market data concepts, native exchange protocols, HDF5 tick storage, feed handler gap detection, and binary encoding. All scenarios map to `lab_marketdata.py` (MD-01 through MD-05).
+This runbook covers market data concepts, native exchange protocols, HDF5 tick storage, feed handler gap detection, binary encoding, live UDP multicast operations, order book management, and market impact analysis. All scenarios map to `lab_marketdata.py` (MD-01 through MD-14).
 
 ---
 
@@ -328,3 +328,243 @@ ask_price = body[3] / 10000.0
 | Order book shows crossed market (bid > ask) | Escalate — missed a delete/cancel message, book corrupted |
 | HDF5 file corrupted | Do not delete — escalate, restore from S3 backup |
 | All feed sessions disconnecting simultaneously | Check multicast group membership and network team |
+
+---
+
+## MD-06 to MD-10 — Live UDP Multicast Operations
+
+### MD-06: Receive from primary/secondary feed
+
+```python
+import socket, struct
+
+def join_multicast(group: str, port: int, iface: str = "0.0.0.0"):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", port))
+    mreq = struct.pack("4s4s", socket.inet_aton(group), socket.inet_aton(iface))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    return sock
+
+# A/B feed arbitration: prefer primary, fall back to secondary on gap or silence
+# Track last received sequence number on each feed
+# If primary gaps: switch to secondary for recovery; switch back after snapshot
+```
+
+### MD-07: Sequence gap detection and recovery
+
+```
+Normal: SEQ 1, 2, 3, 4, 5 ...
+Gap:    SEQ 1, 2, 3, [4, 5, 6 missing], 7, 8 ...
+
+On gap detected:
+1. Mark book as STALE — stop pricing until recovered
+2. Request retransmission (if exchange supports it) or wait for snapshot
+3. Apply snapshot to rebuild book
+4. Apply incrementals with SEQ > snapshot_seq
+5. Mark book as LIVE — resume pricing
+```
+
+### MD-08: NIC buffer tuning for high-throughput feeds
+
+```bash
+# Check current kernel receive buffer maximum
+sysctl net.core.rmem_max    # default: 212992 (208KB) — too small for multicast
+
+# Increase to 256MB for high-throughput market data
+sudo sysctl -w net.core.rmem_max=268435456
+sudo sysctl -w net.core.rmem_default=268435456
+
+# Persist across reboots
+echo "net.core.rmem_max=268435456" | sudo tee -a /etc/sysctl.conf
+
+# Set per-socket buffer in the feed handler
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 67108864)  # 64MB
+```
+
+### MD-09: Feed latency measurement
+
+```python
+# Exchange embeds send timestamp in each packet header
+# Calculate one-way latency: local_recv_time - exchange_send_time
+
+import time
+
+def measure_latency(packet):
+    exchange_ts_us = parse_exchange_timestamp(packet)   # microseconds since epoch
+    local_ts_us    = time.time_ns() // 1000             # convert ns to us
+    latency_us     = local_ts_us - exchange_ts_us
+    return latency_us
+
+# Normal: 50-300µs for co-located systems
+# Spike > 1ms: network congestion, NIC interrupt delay, or CPU scheduling issue
+```
+
+### MD-10: IGMP multicast group membership
+
+```bash
+# List all multicast groups the host is subscribed to
+ip maddr show
+
+# Or
+netstat -g
+
+# Verify IGMP membership for a specific group
+ip maddr show | grep "224.1.1.10"
+
+# IGMP membership is managed automatically by the OS when
+# IP_ADD_MEMBERSHIP is called on a socket
+```
+
+---
+
+## MD-11 — Order Book Invalidation
+
+When a sequence gap is detected in the order book update stream, the book must be marked STALE immediately to prevent pricing on stale data.
+
+```python
+class OrderBook:
+    def __init__(self, symbol):
+        self.symbol = symbol
+        self.bids   = {}    # price → quantity
+        self.asks   = {}
+        self.status = "LIVE"
+        self.last_seq = 0
+
+    def apply(self, msg):
+        seq = msg['seq']
+
+        # Gap detected — invalidate immediately
+        if seq != self.last_seq + 1:
+            self.status = "STALE"
+            raise BookInvalidated(
+                f"{self.symbol}: gap at seq {self.last_seq+1}–{seq-1}"
+            )
+
+        self.last_seq = seq
+        action = msg['action']
+
+        if action == 'ADD':
+            self._add(msg)
+        elif action == 'MODIFY':
+            self._modify(msg)
+        elif action == 'DELETE':
+            self._delete(msg)
+        elif action == 'EXECUTE':
+            self._execute(msg)
+```
+
+### Recovery procedure
+
+```
+1. Mark book STALE on gap
+2. Request snapshot from exchange (or wait for periodic snapshot)
+3. Receive snapshot at SEQ=N — rebuild bids/asks from scratch
+4. Apply all queued incrementals with SEQ > N in order
+5. Mark book LIVE — resume pricing
+```
+
+---
+
+## MD-12 — Snapshot + Incremental Recovery
+
+Exchanges publish periodic snapshots to allow recovery from sequence gaps without waiting for a full session reset.
+
+```python
+def recover_from_snapshot(snapshot, incrementals):
+    """Rebuild order book from snapshot + pending incrementals."""
+    # snapshot = {'seq': 50, 'bids': [...], 'asks': [...]}
+    # incrementals = list of updates received after the gap
+
+    book = OrderBook(snapshot['symbol'])
+    book.bids = {p: q for p, q in snapshot['bids']}
+    book.asks = {p: q for p, q in snapshot['asks']}
+    snap_seq  = snapshot['seq']
+    book.last_seq = snap_seq
+
+    # Apply only incrementals with SEQ > snapshot_seq
+    for inc in sorted(incrementals, key=lambda x: x['seq']):
+        if inc['seq'] <= snap_seq:
+            continue   # stale — already reflected in snapshot
+        book.apply(inc)
+
+    book.status = "LIVE"
+    return book
+```
+
+---
+
+## MD-13 — Crossed Book Detection
+
+A crossed book (bid >= ask) indicates a data feed error and must be caught before the price reaches downstream systems.
+
+```python
+def check_crossed(book):
+    if not book.bids or not book.asks:
+        return False
+
+    best_bid = max(book.bids.keys())
+    best_ask = min(book.asks.keys())
+
+    if best_bid >= best_ask:
+        raise CrossedBook(
+            f"{book.symbol}: bid={best_bid} >= ask={best_ask} — FEED ERROR"
+        )
+    return True
+
+# Crossed book causes:
+# 1. Sequence gap — stale bid/ask from different time points
+# 2. Feed handler bug — applied update to wrong side
+# 3. Exchange error — malformed packet
+# Action: mark book STALE, alert ops, do not use for pricing
+```
+
+---
+
+## MD-14 — Market Impact and Slippage
+
+When executing a large order, you "walk the book" — consuming multiple price levels before filling completely. The difference between the expected price and the actual average fill price is slippage.
+
+```python
+def calculate_market_impact(order_side, order_qty, book):
+    """Calculate average fill price and slippage for a market order."""
+    levels = sorted(book.asks.items()) if order_side == 'BUY' else \
+             sorted(book.bids.items(), reverse=True)
+
+    remaining = order_qty
+    total_cost = 0.0
+    fills = []
+
+    for price, qty in levels:
+        filled = min(remaining, qty)
+        total_cost += filled * price
+        fills.append((price, filled))
+        remaining -= filled
+        if remaining == 0:
+            break
+
+    if remaining > 0:
+        raise InsufficientLiquidity(f"Only {order_qty - remaining} of {order_qty} can fill")
+
+    avg_fill_price = total_cost / order_qty
+    reference_price = levels[0][0]   # best ask (BUY) or best bid (SELL)
+    slippage_bps = abs(avg_fill_price - reference_price) / reference_price * 10000
+
+    return avg_fill_price, slippage_bps, fills
+
+# Example: 4500-share BUY walking 3 ask levels
+# Level 1: 185.10 × 1000 = $185,100
+# Level 2: 185.15 × 2000 = $370,300
+# Level 3: 185.20 × 1500 = $277,800
+# Average fill: $833,200 / 4500 = $185.16
+# Slippage: (185.16 - 185.10) / 185.10 × 10000 = 3.2 bps
+```
+
+### Slippage reference
+
+| Slippage | Context |
+|----------|---------|
+| < 1 bps | Liquid large-cap, small order |
+| 1–5 bps | Normal for medium-sized orders |
+| 5–20 bps | Large order or thin market |
+| > 20 bps | Market impact significant — consider TWAP/VWAP execution |
