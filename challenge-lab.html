@@ -492,6 +492,10 @@
       <span class="nav-dot"></span> Git
       <span class="badge">4</span>
     </div>
+    <div class="nav-item" onclick="showDeck('support')"   id="nav-support">
+      <span class="nav-dot"></span> Support &amp; Incidents
+      <span class="badge">7</span>
+    </div>
   </aside>
 
   <!-- ── Main ── -->
@@ -3429,6 +3433,355 @@ git show HEAD~1:config/kafka.yaml  # previous</code></pre>
       </div>
     </div>
 
+    <!-- ════════════════ SUPPORT & INCIDENTS ════════════════ -->
+    <div class="deck" id="deck-support">
+      <div class="deck-bar">
+        <div class="deck-info">
+          <span class="deck-icon">🚨</span>
+          <div>
+            <div class="deck-label">Support &amp; Incidents</div>
+            <div class="deck-desc">Triage, incident lifecycle, comms, RCA, postmortem</div>
+          </div>
+        </div>
+        <div class="deck-meta">
+          <div class="kbd-hint"><kbd>←</kbd><kbd>→</kbd> navigate</div>
+          <div class="deck-counter" id="ctr-support"><strong>1</strong> / 7</div>
+        </div>
+      </div>
+      <div class="slides-wrap" id="slides-support">
+
+        <!-- Support slide 1: Severity & Triage -->
+        <div class="slide" id="support-0">
+          <h2>Severity Levels &amp; First-5-Minutes Triage</h2>
+          <div class="cols">
+            <div>
+              <h3>Severity Matrix</h3>
+              <table style="width:100%;font-size:0.85em;border-collapse:collapse">
+                <tr style="background:rgba(255,255,255,0.07)">
+                  <th style="padding:5px 8px;text-align:left">Sev</th>
+                  <th style="padding:5px 8px;text-align:left">Definition</th>
+                  <th style="padding:5px 8px;text-align:left">Response</th>
+                  <th style="padding:5px 8px;text-align:left">Update cadence</th>
+                </tr>
+                <tr style="background:rgba(248,113,113,0.12)">
+                  <td style="padding:5px 8px"><strong>P1</strong></td>
+                  <td style="padding:5px 8px">Trading halted, orders not routing, data feed fully down</td>
+                  <td style="padding:5px 8px">Immediate; page on-call lead</td>
+                  <td style="padding:5px 8px">Every 10 min</td>
+                </tr>
+                <tr>
+                  <td style="padding:5px 8px"><strong>P2</strong></td>
+                  <td style="padding:5px 8px">Degraded — one symbol/venue affected, elevated latency, partial gaps</td>
+                  <td style="padding:5px 8px">Within 30 min</td>
+                  <td style="padding:5px 8px">Every 30 min</td>
+                </tr>
+                <tr style="background:rgba(255,255,255,0.04)">
+                  <td style="padding:5px 8px"><strong>P3</strong></td>
+                  <td style="padding:5px 8px">Non-critical feature broken, monitoring gap, manual workaround available</td>
+                  <td style="padding:5px 8px">Business hours</td>
+                  <td style="padding:5px 8px">Daily</td>
+                </tr>
+                <tr>
+                  <td style="padding:5px 8px"><strong>P4</strong></td>
+                  <td style="padding:5px 8px">Cosmetic, question, doc gap</td>
+                  <td style="padding:5px 8px">Next sprint</td>
+                  <td style="padding:5px 8px">On resolution</td>
+                </tr>
+              </table>
+            </div>
+            <div>
+              <h3>First 5 Minutes Checklist</h3>
+              <ul>
+                <li>✅ <strong>Acknowledge</strong> the alert — claim ownership so no one duplicates work</li>
+                <li>✅ <strong>Assess blast radius</strong> — how many systems/users affected?</li>
+                <li>✅ <strong>Check recent changes</strong> — deployments, config pushes, cron jobs in last 2h</li>
+                <li>✅ <strong>Open an incident channel</strong> — #incident-YYYYMMDD in Slack</li>
+                <li>✅ <strong>Start a timeline doc</strong> — every action timestamped, even dead ends</li>
+                <li>✅ <strong>Notify stakeholders</strong> — trading desk lead, on-call manager if P1/P2</li>
+              </ul>
+              <div class="warn">
+                Don't spend the first 5 minutes debugging. Spend them understanding scope. A 30-second outage that affects 10 strategies is a P1; a 2-hour bug that affects nobody active is a P3.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 2: Incident lifecycle -->
+        <div class="slide" id="support-1">
+          <h2>Incident Lifecycle</h2>
+          <div style="margin:16px 0">
+            <div class="flow" style="gap:0;flex-wrap:nowrap;overflow-x:auto">
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(248,113,113,0.15);border-radius:8px 0 0 8px;border:1px solid rgba(248,113,113,0.3)">
+                <div style="font-size:1.4em">🔔</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Detection</div>
+              </div>
+              <div style="align-self:center;padding:0 4px;color:var(--muted)">→</div>
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.3)">
+                <div style="font-size:1.4em">✋</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Acknowledge</div>
+              </div>
+              <div style="align-self:center;padding:0 4px;color:var(--muted)">→</div>
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(56,189,248,0.12);border:1px solid rgba(56,189,248,0.3)">
+                <div style="font-size:1.4em">🔍</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Diagnose</div>
+              </div>
+              <div style="align-self:center;padding:0 4px;color:var(--muted)">→</div>
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(168,85,247,0.12);border:1px solid rgba(168,85,247,0.3)">
+                <div style="font-size:1.4em">🛡️</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Mitigate</div>
+              </div>
+              <div style="align-self:center;padding:0 4px;color:var(--muted)">→</div>
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.3)">
+                <div style="font-size:1.4em">✅</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Resolve</div>
+              </div>
+              <div style="align-self:center;padding:0 4px;color:var(--muted)">→</div>
+              <div style="text-align:center;min-width:100px;padding:12px 8px;background:rgba(255,255,255,0.06);border-radius:0 8px 8px 0;border:1px solid rgba(255,255,255,0.12)">
+                <div style="font-size:1.4em">📝</div><div style="font-size:0.75em;margin-top:4px;font-weight:600">Postmortem</div>
+              </div>
+            </div>
+          </div>
+          <div class="cols">
+            <div>
+              <h3>Mitigation vs Resolution</h3>
+              <ul>
+                <li><strong>Mitigation</strong> — stops the bleeding; system functional again. May be a workaround (restart, rollback, redirect traffic).</li>
+                <li><strong>Resolution</strong> — root cause fixed; no workaround needed. May come days later.</li>
+                <li>Close the incident on <em>mitigation</em>, not resolution — trading can resume. Track the root-cause fix as a separate ticket.</li>
+              </ul>
+              <div class="tip">
+                Rollback is almost always the fastest mitigation. If a deploy triggered the incident, revert first and investigate second.
+              </div>
+            </div>
+            <div>
+              <h3>Roles in a P1</h3>
+              <ul>
+                <li><strong>Incident Commander (IC)</strong> — owns the bridge; delegates; makes go/no-go calls. Not debugging — managing.</li>
+                <li><strong>Tech Lead</strong> — does the hands-on diagnosis and fix. Reports findings to IC.</li>
+                <li><strong>Comms Lead</strong> — writes status updates; keeps stakeholders informed so IC/Tech Lead aren't interrupted.</li>
+                <li><strong>Scribe</strong> — timestamps every action in the doc. Often the IC in smaller teams.</li>
+              </ul>
+              <div class="note">
+                Small teams collapse roles. At minimum: one person owns comms, one person owns technical work. Don't let one engineer debug AND answer questions simultaneously.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 3: Triage for trading systems -->
+        <div class="slide" id="support-2">
+          <h2>Trading-Specific Triage Patterns</h2>
+          <div class="cols">
+            <div>
+              <h3>Feed Gap / Data Missing</h3>
+              <ol>
+                <li>Check feed handler logs for sequence gap messages</li>
+                <li>Is it one symbol or all? → symbol = upstream issue; all = connectivity/process</li>
+                <li>Is A feed or B feed also gapped? → both = upstream or NIC; one = network path</li>
+                <li>Check Kafka consumer lag — is data in Kafka but not consumed?</li>
+                <li>Check HDF5 file shape vs expected row count for the day</li>
+              </ol>
+              <div class="warn">
+                During market hours, a data gap is a P1 until proven otherwise. Researchers and algos may be making decisions on stale data right now.
+              </div>
+            </div>
+            <div>
+              <h3>Order Not Reaching Exchange</h3>
+              <ol>
+                <li>Check FIX session state — is it logged on? (<code>35=A</code> in logs)</li>
+                <li>Check Execution Report (<code>35=8</code>) for reject reason (<code>tag 103</code>)</li>
+                <li>Check OUCH Rejected message — <code>RejectReason</code> byte tells you exactly why</li>
+                <li>Check sequence numbers — gap = session will reject until reset</li>
+                <li>Check port/network connectivity to exchange gateway</li>
+              </ol>
+              <h3>Elevated Latency</h3>
+              <ol>
+                <li><code>kubectl top pod</code> — CPU/memory pressure?</li>
+                <li><code>ss -s</code> — socket buffer overflow? TIME_WAIT pile-up?</li>
+                <li>GC pause? Check JVM logs if Java-based components involved</li>
+                <li>Noisy neighbor? Check node-level CPU steal with <code>top</code></li>
+              </ol>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 4: Communication -->
+        <div class="slide" id="support-3">
+          <h2>Incident Communication</h2>
+          <div class="cols">
+            <div>
+              <h3>Status Update Template</h3>
+              <div class="note" style="font-family:monospace;font-size:0.85em;white-space:pre-wrap">🔴 [INCIDENT] Feed handler sequence gaps — YYYYMMDD HH:MM UTC
+
+**Status:** Investigating
+**Impact:** ITCH feed for AAPL/MSFT showing gaps since 09:32 ET. Researchers on affected symbols should treat data as incomplete.
+**What we know:** Feed handler logs show seq gap at 09:31:57. A-feed and B-feed both affected. Last successful sequence: 1,482,331.
+**Next update:** 10:15 ET or sooner if status changes.
+**IC:** @yourname | **Bridge:** #incident-20240501</div>
+              <div class="tip" style="margin-top:10px">
+                Every update follows the same structure: status, impact, what we know, next update time. Consistency lets readers skim fast.
+              </div>
+            </div>
+            <div>
+              <h3>Escalation Ladder</h3>
+              <ul>
+                <li><strong>Self-resolve (15 min)</strong> — you have a runbook, clear cause, known fix</li>
+                <li><strong>Escalate to senior (30 min)</strong> — unclear root cause or fix requires access you don't have</li>
+                <li><strong>Escalate to vendor (P1)</strong> — exchange connectivity, MSK broker failure, AWS service issue</li>
+                <li><strong>Escalate to management</strong> — financial impact, regulatory implication, breach of SLA</li>
+              </ul>
+              <div class="warn">
+                <strong>Never sit on an incident.</strong> If you've been stuck for 20 minutes without progress, escalate. The cost of over-escalating is low; the cost of under-escalating during market hours is high.
+              </div>
+              <h3>What to Say When Escalating</h3>
+              <p style="font-size:0.9em">
+                "I have a P1. [System] is [symptom] since [time]. I've ruled out [X] and [Y]. I need help with [specific thing]. Can you join the bridge?"
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 5: Root Cause Analysis -->
+        <div class="slide" id="support-4">
+          <h2>Root Cause Analysis</h2>
+          <div class="cols">
+            <div>
+              <h3>5 Whys — Work Backward</h3>
+              <div style="font-size:0.88em">
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(248,113,113,0.1);border-left:3px solid rgba(248,113,113,0.5);border-radius:0 4px 4px 0">
+                  <strong>Problem:</strong> Researchers got stale data for 40 minutes
+                </div>
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(255,255,255,0.04);border-left:3px solid rgba(255,255,255,0.15);border-radius:0 4px 4px 0">
+                  <strong>Why 1:</strong> HDF5 writer pod was OOMKilled and restarted
+                </div>
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(255,255,255,0.04);border-left:3px solid rgba(255,255,255,0.15);border-radius:0 4px 4px 0">
+                  <strong>Why 2:</strong> Memory limit was 512Mi but dataset grew 3x this quarter
+                </div>
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(255,255,255,0.04);border-left:3px solid rgba(255,255,255,0.15);border-radius:0 4px 4px 0">
+                  <strong>Why 3:</strong> Resource limits were set at launch and never reviewed
+                </div>
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(255,255,255,0.04);border-left:3px solid rgba(255,255,255,0.15);border-radius:0 4px 4px 0">
+                  <strong>Why 4:</strong> No memory growth alerting was configured
+                </div>
+                <div style="margin:6px 0;padding:6px 10px;background:rgba(240,180,41,0.1);border-left:3px solid rgba(240,180,41,0.5);border-radius:0 4px 4px 0">
+                  <strong>Root cause:</strong> No process for reviewing resource limits as workloads scale
+                </div>
+              </div>
+            </div>
+            <div>
+              <h3>Timeline Reconstruction</h3>
+              <ul>
+                <li>Pull all relevant logs with a common time window (start 30 min before symptom)</li>
+                <li>Correlate: app logs + k8s events + monitoring alerts + deploy history</li>
+                <li>Find the earliest anomaly — that's your candidate root cause</li>
+              </ul>
+              <pre><code># Pull k8s events sorted by time
+kubectl get events -n trading \
+  --sort-by='.lastTimestamp' | tail -50
+
+# Correlate pod restart time with app error
+kubectl logs tick-writer --previous \
+  | grep -E "ERROR|WARN|OOM" | tail -30</code></pre>
+              <div class="note">
+                The root cause is almost never "it just crashed." Look for the trigger: a deploy, a config change, a data volume threshold crossed, a dependency that became unavailable.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 6: Runbook best practices -->
+        <div class="slide" id="support-5">
+          <h2>Runbook Best Practices</h2>
+          <div class="cols">
+            <div>
+              <h3>What Makes a Good Runbook</h3>
+              <ul>
+                <li><strong>Written for 3am</strong> — assume the reader is tired, stressed, and unfamiliar with this system</li>
+                <li><strong>Symptom-first</strong> — index by what alerts fire or what the user reports, not by system name</li>
+                <li><strong>Copy-pasteable commands</strong> — no "run the usual check"; give the exact command with real variable names</li>
+                <li><strong>Decision tree, not prose</strong> — "if X → go to step 4; if Y → go to step 7"</li>
+                <li><strong>Escape hatch</strong> — always end with "if none of the above worked, escalate to [person/team]"</li>
+                <li><strong>Dated</strong> — include last-verified date; stale runbooks are dangerous</li>
+              </ul>
+            </div>
+            <div>
+              <h3>Runbook Structure Template</h3>
+              <div class="note" style="font-family:monospace;font-size:0.82em;white-space:pre-wrap"># [Alert Name] Runbook
+**Last verified:** YYYY-MM-DD
+**Owner:** team-name
+**Severity:** P1/P2/P3
+
+## Symptoms
+- Alert fires when: ...
+- Users report: ...
+
+## Immediate checks
+1. `kubectl get pods -n trading | grep feed`
+2. If CrashLoopBackOff → go to step 5
+3. If Running → go to step 8
+
+## Mitigation
+`kubectl rollout restart deploy/feed-handler`
+
+## Root cause investigation
+...
+
+## Escalation
+If unresolved after 20 min → page @senior-oncall</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support slide 7: Postmortem -->
+        <div class="slide" id="support-6">
+          <h2>Blameless Postmortem</h2>
+          <div class="cols">
+            <div>
+              <h3>Principles</h3>
+              <ul>
+                <li><strong>Blameless</strong> — people make reasonable decisions given the information they had. The system allowed the failure; fix the system.</li>
+                <li><strong>Focus on contributing factors</strong>, not the person who "caused" it</li>
+                <li><strong>Action items must be assigned and dated</strong> — unowned items never get done</li>
+                <li><strong>Share widely</strong> — postmortems are a knowledge transfer mechanism, not a shame exercise</li>
+              </ul>
+              <div class="tip">
+                A good postmortem surfaces 3–5 contributing factors and generates 3–5 action items. If you only have one cause and one fix, you probably stopped asking "why" too early.
+              </div>
+            </div>
+            <div>
+              <h3>Postmortem Template</h3>
+              <div class="note" style="font-family:monospace;font-size:0.82em;white-space:pre-wrap"># Postmortem: [Title] — YYYY-MM-DD
+
+**Duration:** HH:MM – HH:MM UTC (X min)
+**Severity:** P1
+**Impact:** [who/what was affected, quantified]
+
+## Timeline
+09:31 — First gap detected by monitor
+09:33 — Alert fired, @oncall acknowledged
+09:45 — Root cause identified (OOMKill)
+09:52 — Memory limit raised, pod restarted
+09:54 — Data flowing normally. Incident closed.
+
+## Root cause
+[One paragraph. What failed and why.]
+
+## Contributing factors
+- No memory growth alerting
+- Resource limits never reviewed post-launch
+
+## Action items
+| Action | Owner | Due |
+|--------|-------|-----|
+| Add mem alert on tick-writer | @eng | 2024-05-10 |
+| Quarterly resource limit review | @lead | 2024-06-01 |</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+      <div class="slide-nav">
+        <button class="nav-btn" id="prev-support" onclick="nav('support',-1)" disabled>← Prev</button>
+        <div class="dots" id="dots-support"></div>
+        <button class="nav-btn" id="next-support" onclick="nav('support',1)">Next →</button>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -3440,7 +3793,7 @@ const state = {};   // { deckId: currentIndex }
 const COUNTS = {
   fix: 22, kafka: 8, k8s: 9, marketdata: 8,
   sql: 7, airflow: 8, linux: 6, python: 5,
-  aws: 5, networking: 4, git: 4
+  aws: 5, networking: 4, git: 4, support: 7
 };
 
 // ── Init ──
