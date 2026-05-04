@@ -2,7 +2,7 @@
 """
 Support Engineer Challenge Lab — SQL Setup
 ==========================================
-Creates a SQLite trading database with realistic data for all SQL scenarios (S1-S6).
+Creates a SQLite trading database with realistic data for all SQL scenarios (S1-S8).
 
 Run with: python3 lab_sql.py [--scenario N] [--teardown]
 
@@ -13,6 +13,8 @@ SCENARIOS:
   4   S-04  Top traders by volume — window functions
   5   S-05  Slow query investigation — EXPLAIN + index creation
   6   S-06  Deadlock / locking scenario — concurrent writes + advisory notes
+  7   S-07  Market data gap investigation — find missing symbols and sequence gaps
+  8   S-08  Feed completeness check — compare primary vs secondary feed coverage
   99        ALL (creates full DB + all scripts)
 """
 
@@ -96,6 +98,19 @@ def setup_database():
             actor       TEXT,
             notes       TEXT
         );
+
+        DROP TABLE IF EXISTS tick_data;
+        CREATE TABLE tick_data (
+            id       INTEGER PRIMARY KEY,
+            symbol   TEXT    NOT NULL,
+            ts       TEXT    NOT NULL,
+            price    REAL    NOT NULL,
+            volume   INTEGER NOT NULL,
+            seq_num  INTEGER NOT NULL,
+            feed     TEXT    NOT NULL CHECK(feed IN ('PRIMARY','SECONDARY'))
+        );
+        CREATE INDEX idx_tick_symbol_ts   ON tick_data(symbol, ts);
+        CREATE INDEX idx_tick_feed_symbol ON tick_data(feed, symbol, ts);
     """)
 
     # Traders
@@ -146,10 +161,62 @@ def setup_database():
         (4, 15, 'REJECT',  '2024-01-15 15:00:06', 'risk-system', 'Would exceed max position 150 contracts'),
     ])
 
+    # ── tick_data: market data for S-07 (gap investigation) and S-08 (feed comparison)
+    # PRIMARY feed:   AAPL full day | MSFT full day | TSLA full day | NVDA MISSING 14:30-15:00
+    # SECONDARY feed: AAPL full day | MSFT MISSING 14:30-15:00 | TSLA seq gap at noon | NVDA full day
+    # GOOGL: seq gap on PRIMARY (seqs jump 1001→1009, missing 1002-1008)
+    import random as _rnd
+    _rnd.seed(42)
+    _tick_rows = []
+    _seq = 1
+
+    def _make_ticks(symbol, feed, times, base_price, seq_offset=0, seq_skip_after=None):
+        nonlocal _seq
+        rows = []
+        for i, ts in enumerate(times):
+            px = round(base_price + _rnd.uniform(-0.5, 0.5), 2)
+            vol = _rnd.randint(200, 8000)
+            s = _seq
+            if seq_skip_after and i == seq_skip_after:
+                _seq += 8          # create a gap of 7 seq nums
+            rows.append((symbol, ts, px, vol, s, feed))
+            _seq += 1
+        return rows
+
+    # Build minute-bar timestamps for a trading day
+    _all_times = []
+    for _h in range(9, 16):
+        for _m in range(0, 60):
+            if _h == 9 and _m < 30: continue
+            if _h == 15 and _m > 0: continue
+            _all_times.append(f"2026-05-01 {_h:02d}:{_m:02d}:00")
+
+    _window_times = [t for t in _all_times if "14:3" in t or "14:4" in t or "14:5" in t]  # 30 ticks
+    _pre_window   = [t for t in _all_times if t not in _window_times]                       # 360 ticks
+
+    # PRIMARY feed
+    _tick_rows += _make_ticks("AAPL",  "PRIMARY",   _all_times,  185.00)                     # full day
+    _tick_rows += _make_ticks("MSFT",  "PRIMARY",   _all_times,  420.00)                     # full day
+    _tick_rows += _make_ticks("TSLA",  "PRIMARY",   _all_times,  248.00)                     # full day
+    _tick_rows += _make_ticks("GOOGL", "PRIMARY",   _all_times,  175.00, seq_skip_after=50)  # seq gap
+    _tick_rows += _make_ticks("NVDA",  "PRIMARY",   _pre_window, 495.00)                     # missing 14:30-15:00
+
+    # SECONDARY feed
+    _tick_rows += _make_ticks("AAPL",  "SECONDARY", _all_times,  185.00)                     # full day
+    _tick_rows += _make_ticks("MSFT",  "SECONDARY", _pre_window, 420.00)                     # missing 14:30-15:00
+    _tick_rows += _make_ticks("TSLA",  "SECONDARY", _all_times,  248.00, seq_skip_after=30)  # seq gap
+    _tick_rows += _make_ticks("GOOGL", "SECONDARY", _all_times,  175.00)                     # full day
+    _tick_rows += _make_ticks("NVDA",  "SECONDARY", _all_times,  495.00)                     # full day
+
+    c.executemany(
+        "INSERT INTO tick_data (symbol, ts, price, volume, seq_num, feed) VALUES (?,?,?,?,?,?)",
+        _tick_rows,
+    )
+
     conn.commit()
     conn.close()
     ok(f"Database created: {DB_PATH}")
-    ok("Tables: traders (5 rows), trades (15 rows), positions (6 rows), orders_audit (4 rows)")
+    ok("Tables: traders(5) trades(15) positions(6) orders_audit(4) tick_data(see S-07/08)")
 
 
 # ══════════════════════════════════════════════
@@ -717,10 +784,324 @@ ON CONFLICT (trader_id, symbol) DO UPDATE
 """)
 
 
+# ══════════════════════════════════════════════
+#  SCENARIO 7 — Market Data Gap Investigation
+# ══════════════════════════════════════════════
+
+def launch_scenario_7():
+    header("Scenario S-07 — Market Data Gap Investigation")
+    print("  A researcher opens a ticket: 'NVDA data looks wrong for yesterday afternoon.'")
+    print("  Use SQL to identify which symbols have gaps in the tick_data table.\n")
+
+    setup_database()   # ensure DB exists with tick_data
+
+    write_solution("s07_01_zero_tick_window.sql", """\
+-- S-07a: Find symbols with ZERO ticks in the 14:30-15:00 window (PRIMARY feed)
+-- This is the first query to run when a researcher reports missing afternoon data.
+
+SELECT   symbol,
+         COUNT(*) AS tick_count
+FROM     tick_data
+WHERE    feed = 'PRIMARY'
+  AND    ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+GROUP BY symbol
+ORDER BY tick_count ASC;
+
+-- Expected: NVDA shows 0 ticks (or does not appear), others show ~30 ticks.
+-- If a symbol is MISSING entirely from results, use:
+
+SELECT DISTINCT symbol FROM tick_data WHERE feed = 'PRIMARY'
+EXCEPT
+SELECT symbol FROM tick_data
+WHERE  feed = 'PRIMARY'
+  AND  ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00';
+-- Returns symbols that have data elsewhere but NOTHING in this window.
+""")
+
+    write_solution("s07_02_last_good_tick.sql", """\
+-- S-07b: Find the last good timestamp before the gap (per symbol, PRIMARY feed)
+-- Run after identifying NVDA has zero ticks in the 14:30 window.
+
+SELECT   symbol,
+         MAX(ts)    AS last_tick_before_gap,
+         MAX(price) AS last_price,
+         MAX(seq_num) AS last_seq_num
+FROM     tick_data
+WHERE    feed   = 'PRIMARY'
+  AND    symbol = 'NVDA'
+  AND    ts     < '2026-05-01 14:30:00'
+GROUP BY symbol;
+
+-- This tells you: the feed was alive up to X, then went silent.
+-- Useful for Kafka lag correlation: did the consumer stop at that time too?
+""")
+
+    write_solution("s07_03_sequence_gaps.sql", """\
+-- S-07c: Find sequence number gaps per symbol (indicates dropped ticks)
+-- A gap in seq_num means ticks were DROPPED between the exchange and storage.
+
+WITH numbered AS (
+    SELECT symbol,
+           feed,
+           ts,
+           seq_num,
+           LAG(seq_num) OVER (PARTITION BY symbol, feed ORDER BY seq_num) AS prev_seq
+    FROM   tick_data
+    WHERE  feed = 'PRIMARY'
+)
+SELECT symbol,
+       feed,
+       prev_seq          AS gap_starts_after,
+       seq_num           AS gap_ends_at,
+       (seq_num - prev_seq - 1) AS ticks_missing,
+       ts                AS resumed_at
+FROM   numbered
+WHERE  prev_seq IS NOT NULL
+  AND  (seq_num - prev_seq) > 1
+ORDER BY ticks_missing DESC;
+
+-- GOOGL PRIMARY should show a gap of 7 missing ticks.
+-- A gap means: either the Kafka consumer dropped messages, or the feed handler
+-- did not receive them (UDP multicast packet loss).
+""")
+
+    write_solution("s07_04_tick_count_by_hour.sql", """\
+-- S-07d: Tick count by symbol and hour — spot the dead period visually
+-- Good for a quick sanity check across the whole trading day.
+
+SELECT   symbol,
+         feed,
+         SUBSTR(ts, 1, 13) AS hour,
+         COUNT(*)           AS tick_count
+FROM     tick_data
+WHERE    feed = 'PRIMARY'
+GROUP BY symbol, feed, hour
+ORDER BY symbol, hour;
+
+-- Look for symbols where tick_count drops to 0 for one or more hours.
+-- NVDA will show 0 for the 14:xx hour.
+""")
+
+    print(f"""
+{BOLD}── DB path ───────────────────────────────────────────────────{RESET}
+{CYAN}  sqlite3 {DB_PATH}{RESET}
+
+{BOLD}── S-07a: Which symbols have zero ticks in the 14:30 window? ──{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s07_01_zero_tick_window.sql{RESET}
+""")
+    run_query("""
+        SELECT symbol, COUNT(*) AS tick_count
+        FROM   tick_data
+        WHERE  feed = 'PRIMARY'
+          AND  ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+        GROUP BY symbol ORDER BY tick_count ASC
+    """)
+
+    print(f"""
+{BOLD}── S-07b: Last good tick before the gap ──────────────────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s07_02_last_good_tick.sql{RESET}
+
+{BOLD}── S-07c: Sequence number gaps (dropped ticks) ───────────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s07_03_sequence_gaps.sql{RESET}
+""")
+    run_query("""
+        WITH numbered AS (
+            SELECT symbol, feed, seq_num,
+                   LAG(seq_num) OVER (PARTITION BY symbol, feed ORDER BY seq_num) AS prev_seq
+            FROM   tick_data WHERE feed = 'PRIMARY'
+        )
+        SELECT symbol, prev_seq AS gap_starts_after, seq_num AS gap_ends_at,
+               (seq_num - prev_seq - 1) AS ticks_missing
+        FROM   numbered
+        WHERE  prev_seq IS NOT NULL AND (seq_num - prev_seq) > 1
+        ORDER BY ticks_missing DESC
+    """)
+
+    print(f"""
+{BOLD}── S-07d: Tick count by hour ─────────────────────────────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s07_04_tick_count_by_hour.sql{RESET}
+
+{BOLD}── Key Interview Points ─────────────────────────────────{RESET}
+  STEP 1: COUNT(*) grouped by symbol in the suspect window → find the zero
+  STEP 2: EXCEPT query → symbols present elsewhere but missing from window
+  STEP 3: MAX(ts) WHERE ts < window_start → last good timestamp before gap
+  STEP 4: LAG(seq_num) OVER PARTITION BY symbol → find sequence gaps
+  STEP 5: Correlate gap timestamp with Kafka lag logs / Argo Workflow logs
+
+  Escalation note should include:
+    - Affected symbol(s) and exact time window
+    - Last known good seq_num before the gap
+    - Whether gap is on PRIMARY, SECONDARY, or both
+    - Corresponding Kafka consumer lag at that timestamp
+""")
+
+
+# ══════════════════════════════════════════════
+#  SCENARIO 8 — Feed Completeness Cross-Check
+# ══════════════════════════════════════════════
+
+def launch_scenario_8():
+    header("Scenario S-08 — Feed Completeness Cross-Check (Primary vs Secondary)")
+    print("  Your firm receives tick data from two redundant feeds.")
+    print("  Use SQL to find symbols where one feed has data the other is missing.\n")
+    print("  SECONDARY feed is missing MSFT data for the 14:30-15:00 window.")
+    print("  TSLA has a sequence gap on SECONDARY but not PRIMARY.\n")
+
+    setup_database()
+
+    write_solution("s08_01_feed_coverage_comparison.sql", """\
+-- S-08a: Find symbols with ticks on PRIMARY but NOT on SECONDARY in a window
+-- Run this when validating feed redundancy or after a secondary feed incident.
+
+SELECT   p.symbol,
+         COUNT(p.id)                    AS primary_ticks,
+         COALESCE(COUNT(s.id), 0)       AS secondary_ticks,
+         COUNT(p.id) - COALESCE(COUNT(s.id), 0) AS delta
+FROM     tick_data p
+LEFT JOIN tick_data s
+       ON s.symbol = p.symbol
+      AND s.ts     = p.ts
+      AND s.feed   = 'SECONDARY'
+WHERE    p.feed = 'PRIMARY'
+  AND    p.ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+GROUP BY p.symbol
+ORDER BY delta DESC;
+
+-- delta > 0 means PRIMARY has ticks that SECONDARY is missing.
+-- MSFT should show the largest delta.
+""")
+
+    write_solution("s08_02_secondary_only_gaps.sql", """\
+-- S-08b: Timestamps on PRIMARY with no matching tick on SECONDARY
+-- Drill into MSFT to find exactly which minutes are missing on SECONDARY.
+
+SELECT   p.ts,
+         p.symbol,
+         p.seq_num        AS primary_seq,
+         p.price          AS primary_price,
+         s.seq_num        AS secondary_seq    -- NULL if missing
+FROM     tick_data p
+LEFT JOIN tick_data s
+       ON s.symbol = p.symbol
+      AND s.ts     = p.ts
+      AND s.feed   = 'SECONDARY'
+WHERE    p.feed   = 'PRIMARY'
+  AND    p.symbol = 'MSFT'
+  AND    p.ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+  AND    s.id IS NULL
+ORDER BY p.ts;
+
+-- Every row returned = a minute-bar missing on the secondary feed.
+""")
+
+    write_solution("s08_03_seq_gap_comparison.sql", """\
+-- S-08c: Compare sequence gaps between PRIMARY and SECONDARY
+-- A gap on both feeds = exchange/network issue.
+-- A gap on one feed only = that feed handler dropped packets.
+
+WITH gaps AS (
+    SELECT feed,
+           symbol,
+           seq_num,
+           LAG(seq_num) OVER (PARTITION BY feed, symbol ORDER BY seq_num) AS prev_seq,
+           ts
+    FROM   tick_data
+    WHERE  symbol = 'TSLA'
+)
+SELECT feed,
+       symbol,
+       prev_seq           AS gap_after_seq,
+       seq_num            AS gap_before_seq,
+       (seq_num - prev_seq - 1) AS missing_count,
+       ts                 AS gap_detected_at
+FROM   gaps
+WHERE  prev_seq IS NOT NULL
+  AND  (seq_num - prev_seq) > 1
+ORDER BY feed, gap_after_seq;
+
+-- TSLA SECONDARY should show a gap; PRIMARY should not.
+-- This tells you the issue is in the secondary feed handler, not the exchange.
+""")
+
+    write_solution("s08_04_summary_report.sql", """\
+-- S-08d: Full feed completeness summary for the trading day
+-- Run at EOD to validate both feeds captured all symbols.
+
+SELECT   symbol,
+         feed,
+         COUNT(*)           AS total_ticks,
+         MIN(ts)            AS first_tick,
+         MAX(ts)            AS last_tick,
+         MAX(seq_num) - MIN(seq_num) + 1 AS expected_seq_range,
+         COUNT(*)           AS actual_count,
+         (MAX(seq_num) - MIN(seq_num) + 1) - COUNT(*) AS seq_gaps
+FROM     tick_data
+GROUP BY symbol, feed
+ORDER BY symbol, feed;
+
+-- seq_gaps > 0 means sequence numbers are not contiguous — ticks were dropped.
+-- Cross-reference with expected_seq_range vs actual_count.
+""")
+
+    print(f"""
+{BOLD}── S-08a: Which symbols are PRIMARY-only in the 14:30 window? ─{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s08_01_feed_coverage_comparison.sql{RESET}
+""")
+    run_query("""
+        SELECT p.symbol,
+               COUNT(p.id) AS primary_ticks,
+               COALESCE(COUNT(s.id), 0) AS secondary_ticks,
+               COUNT(p.id) - COALESCE(COUNT(s.id), 0) AS delta
+        FROM   tick_data p
+        LEFT JOIN tick_data s ON s.symbol=p.symbol AND s.ts=p.ts AND s.feed='SECONDARY'
+        WHERE  p.feed='PRIMARY'
+          AND  p.ts BETWEEN '2026-05-01 14:30:00' AND '2026-05-01 14:59:00'
+        GROUP BY p.symbol ORDER BY delta DESC
+    """)
+
+    print(f"""
+{BOLD}── S-08b: Exact missing minutes for MSFT on SECONDARY ───────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s08_02_secondary_only_gaps.sql{RESET}
+
+{BOLD}── S-08c: Seq gap comparison PRIMARY vs SECONDARY (TSLA) ────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s08_03_seq_gap_comparison.sql{RESET}
+""")
+    run_query("""
+        WITH gaps AS (
+            SELECT feed, symbol, seq_num,
+                   LAG(seq_num) OVER (PARTITION BY feed, symbol ORDER BY seq_num) AS prev_seq,
+                   ts
+            FROM   tick_data WHERE symbol = 'TSLA'
+        )
+        SELECT feed, symbol, prev_seq AS gap_after_seq, seq_num AS gap_before_seq,
+               (seq_num - prev_seq - 1) AS missing_count
+        FROM   gaps WHERE prev_seq IS NOT NULL AND (seq_num - prev_seq) > 1
+        ORDER BY feed
+    """)
+
+    print(f"""
+{BOLD}── S-08d: Full EOD completeness summary ─────────────────────{RESET}
+{CYAN}  sqlite3 {DB_PATH} < {DIRS["scripts"]}/s08_04_summary_report.sql{RESET}
+
+{BOLD}── Key Interview Points ─────────────────────────────────────{RESET}
+  LEFT JOIN feeds on (symbol, ts) → find timestamps present on one but not the other
+  LAG(seq_num) OVER PARTITION BY (feed, symbol) → sequence gap detection
+  Gap on BOTH feeds = exchange/network issue (escalate to vendor)
+  Gap on ONE feed only = that feed handler dropped packets (internal fix)
+
+  The escalation note to dev should answer:
+    - Which feed is affected (PRIMARY, SECONDARY, or both)?
+    - Which symbols and what time window?
+    - Are the seq_nums on the other feed continuous (confirming single-feed issue)?
+    - What is the tick count delta between feeds?
+""")
+
+
 def launch_scenario_99():
     header("Scenario 99 — ALL SQL Scenarios")
     for fn in [launch_scenario_1, launch_scenario_2, launch_scenario_3,
-               launch_scenario_4, launch_scenario_5, launch_scenario_6]:
+               launch_scenario_4, launch_scenario_5, launch_scenario_6,
+               launch_scenario_7, launch_scenario_8]:
         fn(); time.sleep(0.1)
 
 
@@ -748,13 +1129,15 @@ def show_status():
         warn("Database not found — run a scenario first")
 
 SCENARIO_MAP = {
-    1:  (launch_scenario_1, "S-01  Find all fills for a trader"),
-    2:  (launch_scenario_2, "S-02  Rejected orders report"),
-    3:  (launch_scenario_3, "S-03  Net position & discrepancy check"),
-    4:  (launch_scenario_4, "S-04  Leaderboard with window functions"),
-    5:  (launch_scenario_5, "S-05  Slow query + EXPLAIN + index"),
-    6:  (launch_scenario_6, "S-06  Concurrent writes & locking"),
-    99: (launch_scenario_99, "     ALL scenarios"),
+    1:  (launch_scenario_1,  "S-01  Find all fills for a trader"),
+    2:  (launch_scenario_2,  "S-02  Rejected orders report"),
+    3:  (launch_scenario_3,  "S-03  Net position & discrepancy check"),
+    4:  (launch_scenario_4,  "S-04  Leaderboard with window functions"),
+    5:  (launch_scenario_5,  "S-05  Slow query + EXPLAIN + index"),
+    6:  (launch_scenario_6,  "S-06  Concurrent writes & locking"),
+    7:  (launch_scenario_7,  "S-07  Market data gap investigation"),
+    8:  (launch_scenario_8,  "S-08  Feed completeness cross-check (primary vs secondary)"),
+    99: (launch_scenario_99, "      ALL scenarios"),
 }
 
 def main():
