@@ -1289,12 +1289,521 @@ print("    cat /proc/net/softnet_stat  → column 2 = kernel drops")
 """)
 
 
+def launch_scenario_11():
+    header("Scenario MD-11 — Book Invalidation on Sequence Gap")
+    print("  When a gap is detected the book state is UNKNOWN.")
+    print("  Trading must halt on that symbol until the book is rebuilt.\n")
+
+    from datetime import timedelta
+    now = datetime.now()
+    def ts(s): return (now + timedelta(seconds=s)).strftime("%H:%M:%S.%f")[:-3]
+
+    # Stream with a deliberate gap at seq 8-10
+    updates = [
+        f"SEQ=1|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.90|QTY=500|OID=O001",
+        f"SEQ=2|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.85|QTY=300|OID=O002",
+        f"SEQ=3|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.10|QTY=400|OID=O003",
+        f"SEQ=4|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.15|QTY=600|OID=O004",
+        f"SEQ=5|TS={ts(1)}|SYM=AAPL|TYPE=MODIFY|SIDE=BUY|PX=184.90|QTY=250|OID=O001",
+        f"SEQ=6|TS={ts(1)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.95|QTY=800|OID=O005",
+        f"SEQ=7|TS={ts(2)}|SYM=AAPL|TYPE=EXECUTE|SIDE=SELL|PX=185.10|QTY=200|OID=O003",
+        # GAP: SEQ 8, 9, 10 missing — book is now UNKNOWN
+        f"SEQ=11|TS={ts(3)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.80|QTY=1000|OID=O006",
+        f"SEQ=12|TS={ts(3)}|SYM=AAPL|TYPE=DELETE|SIDE=SELL|PX=185.15|QTY=0|OID=O004",
+        f"SEQ=13|TS={ts(4)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.05|QTY=700|OID=O007",
+    ]
+    log = DIRS["data"] / "gap_book_updates.log"
+    log.write_text("\n".join(updates) + "\n")
+    ok(f"Book update log (gap at SEQ 8-10): {log}")
+
+    script = DIRS["scripts"] / "book_with_invalidation.py"
+    script.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"MD-11: Build L2 book; mark STALE on gap; show why trading must stop.\"\"\"
+from collections import defaultdict
+
+LOG = '{log}'
+LEVELS = 5
+
+book  = defaultdict(lambda: {{'BUY': {{}}, 'SELL': {{}}}})
+state = {{}}   # 'FRESH' or 'STALE' per symbol
+
+def print_book(sym, note=""):
+    status = state.get(sym, 'FRESH')
+    bids = sorted(book[sym]['BUY'].items(),  reverse=True)[:LEVELS]
+    asks = sorted(book[sym]['SELL'].items())[:LEVELS]
+    color = "\\033[31m" if status == 'STALE' else "\\033[32m"
+    reset = "\\033[0m"
+    print(f"\\n  ── {{sym}} Book  [{{color}}{{status}}{{reset}}]  {{note}}")
+    print(f"  {{' ASK PX':>10}}  {{' ASK QTY':>9}}")
+    for px, qty in reversed(asks):
+        print(f"  {{px:>10.2f}}  {{qty:>9}}")
+    spread = round(asks[0][0] - bids[0][0], 4) if bids and asks else "N/A"
+    print(f"  {{'─── spread: ' + str(spread) + ' ───':^23}}")
+    for px, qty in bids:
+        print(f"  {{px:>10.2f}}  {{qty:>9}}")
+    print(f"  {{' BID PX':>10}}  {{' BID QTY':>9}}")
+    if status == 'STALE':
+        print(f"  ⚠  Book is STALE — do NOT use for trading decisions!")
+        print(f"     Action: send RetransmitRequest or request Snapshot")
+
+expected = 1
+with open(LOG) as f:
+    for line in f:
+        fields = dict(p.split('=',1) for p in line.strip().split('|') if '=' in p)
+        seq  = int(fields['SEQ'])
+        sym  = fields['SYM']
+        mtype = fields['TYPE']
+        side  = fields['SIDE']
+        px    = float(fields['PX'])
+        qty   = int(fields['QTY'])
+
+        if seq != expected:
+            state[sym] = 'STALE'
+            print(f"\\n  *** GAP DETECTED: expected SEQ={{expected}} got {{seq}} ***")
+            print(f"      Marking {{sym}} book as STALE — applying remaining updates anyway")
+            print(f"      In production: halt trading on {{sym}} immediately")
+            expected = seq + 1
+        else:
+            expected += 1
+
+        if mtype == 'ADD':
+            book[sym][side][px] = book[sym][side].get(px, 0) + qty
+        elif mtype == 'MODIFY':
+            book[sym][side][px] = qty
+        elif mtype in ('DELETE', 'EXECUTE'):
+            book[sym][side][px] = max(0, book[sym][side].get(px, 0) - qty)
+            if book[sym][side].get(px, 0) == 0:
+                book[sym][side].pop(px, None)
+
+        if seq in (7, 11, 13):
+            print_book(sym, f"after SEQ={{seq}} {{mtype}}")
+
+print(f\"\"\"
+── Why Book Invalidation Matters ─────────────────────────────────
+  After SEQ 7: book is FRESH — best bid 184.95, best ask 185.10
+  SEQ 8-10 are MISSING — we don't know what happened in those msgs:
+    Could be: large EXECUTE that moved the book significantly
+    Could be: DELETE of the best bid or ask
+    Could be: new ADD that crossed the book
+
+  If we trade on the stale book:
+    Risk engine uses wrong position → limit breach
+    Order router sends to wrong price → bad fill
+    Compliance sees trading on bad data → regulatory issue
+
+  Recovery steps:
+    1. Detect gap (seq jump)
+    2. Mark book STALE, halt trading on that symbol
+    3. Send RetransmitRequest for SEQ 8-10 (TCP recovery channel)
+    4. If no reply in 5s → request full Snapshot from exchange
+    5. Apply Snapshot, then replay incrementals from snapshot seq
+    6. Mark book FRESH, resume trading
+\"\"\")
+""")
+    ok(f"Book invalidation script: {script}")
+
+    print(f"""
+{BOLD}── Your Tasks ─────────────────────────────────────────{RESET}
+  1. Read the raw update log — spot the gap
+{CYAN}       cat {log}{RESET}
+
+  2. Run the book builder — watch it detect the gap and go STALE
+{CYAN}       python3 {script}{RESET}
+
+  3. Use awk to extract just the sequence numbers
+{CYAN}       awk -F'|' '{{print $1}}' {log}{RESET}
+
+  4. Find the gap with awk
+{CYAN}       awk -F'|' '{{n=substr($1,5)+0; if(n!=prev+1 && prev>0) print "GAP: "prev+1" to "n-1; prev=n}}' {log}{RESET}
+
+{BOLD}── Key Interview Points ───────────────────────────────{RESET}
+  • Gap = book state unknown = must halt trading on affected symbol
+  • Never trade on a stale book — bad fills, limit breaches, regulatory risk
+  • Invalidation is per-symbol — a gap on AAPL doesn't affect MSFT
+  • Snapshot + incremental is the standard recovery pattern
+""")
+
+
+def launch_scenario_12():
+    header("Scenario MD-12 — Snapshot + Incremental Recovery")
+    print("  After a gap the exchange sends a full book Snapshot.")
+    print("  Apply the snapshot, then replay incrementals to reach current state.\n")
+
+    from datetime import timedelta
+    now = datetime.now()
+    def ts(s): return (now + timedelta(seconds=s)).strftime("%H:%M:%S.%f")[:-3]
+
+    # Snapshot at SEQ=50 — full book state
+    snapshot = {
+        "seq":    50,
+        "symbol": "AAPL",
+        "bids":   {184.95: 1200, 184.90: 800, 184.85: 500, 184.80: 300},
+        "asks":   {185.05: 700,  185.10: 400, 185.15: 900, 185.20: 200},
+    }
+    snap_file = DIRS["data"] / "book_snapshot.json"
+    import json
+    snap_file.write_text(json.dumps(snapshot, indent=2))
+    ok(f"Snapshot file (at SEQ=50): {snap_file}")
+
+    # Incremental updates AFTER the snapshot
+    incrementals = [
+        f"SEQ=51|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=185.00|QTY=600|OID=O100",
+        f"SEQ=52|TS={ts(0)}|SYM=AAPL|TYPE=EXECUTE|SIDE=SELL|PX=185.05|QTY=300|OID=O101",
+        f"SEQ=53|TS={ts(1)}|SYM=AAPL|TYPE=DELETE|SIDE=SELL|PX=185.05|QTY=0|OID=O101",
+        f"SEQ=54|TS={ts(1)}|SYM=AAPL|TYPE=MODIFY|SIDE=BUY|PX=184.95|QTY=900|OID=O102",
+        f"SEQ=55|TS={ts(2)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.02|QTY=500|OID=O103",
+        f"SEQ=56|TS={ts(2)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=185.01|QTY=800|OID=O104",
+    ]
+    inc_file = DIRS["data"] / "book_incrementals.log"
+    inc_file.write_text("\n".join(incrementals) + "\n")
+    ok(f"Incremental updates (SEQ 51-56): {inc_file}")
+
+    script = DIRS["scripts"] / "snapshot_recovery.py"
+    script.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"MD-12: Rebuild order book from snapshot then apply incrementals.\"\"\"
+import json
+
+SNAP_FILE = '{snap_file}'
+INC_FILE  = '{inc_file}'
+LEVELS    = 5
+
+def print_book(bids, asks, title):
+    top_bids = sorted(bids.items(), reverse=True)[:LEVELS]
+    top_asks = sorted(asks.items())[:LEVELS]
+    spread   = round(top_asks[0][0] - top_bids[0][0], 4) if top_bids and top_asks else "N/A"
+    print(f"\\n  ── {{title}} (spread={{spread}}) ──────────────────")
+    print(f"  {{' ASK PX':>10}}  {{'ASK QTY':>9}}")
+    for px, qty in reversed(top_asks):
+        print(f"  {{px:>10.2f}}  {{qty:>9}}")
+    print(f"  {{'─── spread: ' + str(spread) + ' ───':^25}}")
+    for px, qty in top_bids:
+        print(f"  {{px:>10.2f}}  {{qty:>9}}")
+    print(f"  {{' BID PX':>10}}  {{'BID QTY':>9}}")
+
+# ── Step 1: Load Snapshot ──────────────────────────────
+with open(SNAP_FILE) as f:
+    snap = json.load(f)
+
+bids = {{float(k): v for k, v in snap['bids'].items()}}
+asks = {{float(k): v for k, v in snap['asks'].items()}}
+seq  = snap['seq']
+sym  = snap['symbol']
+
+print(f"Step 1: Loaded snapshot for {{sym}} at SEQ={{seq}}")
+print_book(bids, asks, f"Snapshot State (SEQ={{seq}})")
+
+# ── Step 2: Apply Incrementals ────────────────────────
+print(f"\\nStep 2: Applying incrementals from SEQ {{seq+1}}...")
+with open(INC_FILE) as f:
+    for line in f:
+        fields = dict(p.split('=',1) for p in line.strip().split('|') if '=' in p)
+        inc_seq = int(fields['SEQ'])
+        if inc_seq <= seq:
+            print(f"  SKIP SEQ={{inc_seq}} — already in snapshot")
+            continue
+        mtype = fields['TYPE']
+        side  = fields['SIDE']
+        px    = float(fields['PX'])
+        qty   = int(fields['QTY'])
+        book  = bids if side == 'BUY' else asks
+        if mtype == 'ADD':
+            book[px] = book.get(px, 0) + qty
+        elif mtype == 'MODIFY':
+            book[px] = qty
+        elif mtype in ('DELETE', 'EXECUTE'):
+            book[px] = max(0, book.get(px, 0) - qty)
+            if book.get(px, 0) == 0:
+                book.pop(px, None)
+        print(f"  Applied SEQ={{inc_seq}} {{mtype:<8}} {{side:<5}} {{px:.2f}} qty={{qty}}")
+
+print_book(bids, asks, "Final State (after snapshot + incrementals)")
+
+print(\"\"\"
+── Snapshot + Incremental Protocol ──────────────────────────────
+  1. Gap detected at SEQ N → book STALE, trading halted
+  2. Request Snapshot from exchange
+     Exchange sends: full book state at SEQ=M (M >= N)
+  3. Apply snapshot → book now FRESH at SEQ=M
+  4. Buffer incrementals received DURING snapshot delivery (SEQ > M)
+  5. Apply buffered incrementals in order
+  6. Book is now current → trading resumes
+
+  Key: DO NOT apply incrementals with SEQ <= snapshot SEQ
+  They are already included in the snapshot state.
+
+  This is called "Snapshot + Incremental" or "S+I" recovery.
+  Used by: CME MDP 3.0, NASDAQ ITCH, NYSE XDP
+\"\"\")
+""")
+    ok(f"Snapshot recovery script: {script}")
+
+    print(f"""
+{BOLD}── Your Tasks ─────────────────────────────────────────{RESET}
+  1. Inspect the snapshot
+{CYAN}       cat {snap_file}{RESET}
+
+  2. Inspect the incremental updates
+{CYAN}       cat {inc_file}{RESET}
+
+  3. Run the recovery and watch the book rebuild
+{CYAN}       python3 {script}{RESET}
+
+  4. Use awk to verify all incrementals are after the snapshot seq
+{CYAN}       awk -F'|' '{{print substr($1,5)}}' {inc_file}{RESET}
+
+{BOLD}── Key Interview Points ───────────────────────────────{RESET}
+  • Snapshot = full book state at a given sequence number
+  • Incrementals with SEQ ≤ snapshot SEQ must be discarded (already included)
+  • Buffer incrementals WHILE waiting for snapshot — don't miss any
+  • Gap recovery is not instant — expect 100ms to 2s depending on exchange
+  • Some exchanges offer: A) replay channel B) snapshot channel C) both
+""")
+
+
+def launch_scenario_13():
+    header("Scenario MD-13 — Crossed Book Detection")
+    print("  A crossed book (best bid ≥ best ask) means the data is bad.")
+    print("  Detect it, alert, and mark the book invalid.\n")
+
+    from datetime import timedelta
+    now = datetime.now()
+    def ts(s): return (now + timedelta(seconds=s)).strftime("%H:%M:%S.%f")[:-3]
+
+    # Stream that produces a crossed book
+    updates = [
+        f"SEQ=1|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.90|QTY=500|OID=O001",
+        f"SEQ=2|TS={ts(0)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.10|QTY=400|OID=O002",
+        f"SEQ=3|TS={ts(1)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=185.00|QTY=300|OID=O003",
+        # Normal — spread = 185.10 - 185.00 = 0.10
+        f"SEQ=4|TS={ts(2)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=185.15|QTY=200|OID=O004",
+        # CROSSED — best bid 185.15 > best ask 185.10 → BAD DATA
+        f"SEQ=5|TS={ts(2)}|SYM=AAPL|TYPE=ADD|SIDE=SELL|PX=185.20|QTY=600|OID=O005",
+        f"SEQ=6|TS={ts(3)}|SYM=AAPL|TYPE=DELETE|SIDE=BUY|PX=185.15|QTY=0|OID=O004",
+        # Uncrossed after delete — book recovers
+        f"SEQ=7|TS={ts(3)}|SYM=AAPL|TYPE=ADD|SIDE=BUY|PX=184.95|QTY=400|OID=O006",
+    ]
+    log = DIRS["data"] / "crossed_book_updates.log"
+    log.write_text("\n".join(updates) + "\n")
+    ok(f"Crossed book update log: {log}")
+
+    script = DIRS["scripts"] / "crossed_book_detector.py"
+    script.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"MD-13: Build L2 book and detect when it crosses (bid >= ask).\"\"\"
+
+LOG    = '{log}'
+LEVELS = 4
+
+book = {{'BUY': {{}}, 'SELL': {{}}}}
+
+def best_bid(): return max(book['BUY'].keys())  if book['BUY']  else None
+def best_ask(): return min(book['SELL'].keys()) if book['SELL'] else None
+
+def check_cross(seq):
+    bb, ba = best_bid(), best_ask()
+    if bb is None or ba is None:
+        return
+    spread = round(ba - bb, 4)
+    if bb >= ba:
+        print(f"  *** CROSSED BOOK at SEQ={{seq}}: bid={{bb}} >= ask={{ba}} spread={{spread}} ***")
+        print(f"      → Mark book INVALID, alert market data team")
+        print(f"      → Do NOT use this book for pricing or routing")
+        print(f"      → Likely cause: bad tick, feed error, or delayed DELETE")
+    else:
+        print(f"  Book OK: bid={{bb:.2f}} ask={{ba:.2f}} spread={{spread:.4f}}")
+
+with open(LOG) as f:
+    for line in f:
+        fields = dict(p.split('=',1) for p in line.strip().split('|') if '=' in p)
+        seq   = fields['SEQ']
+        mtype = fields['TYPE']
+        side  = fields['SIDE']
+        px    = float(fields['PX'])
+        qty   = int(fields['QTY'])
+        print(f"  SEQ={{seq:>2}}  {{mtype:<8}} {{side:<5}} {{px:.2f}}  qty={{qty}}")
+        if mtype == 'ADD':
+            book[side][px] = book[side].get(px,0) + qty
+        elif mtype == 'MODIFY':
+            book[side][px] = qty
+        elif mtype in ('DELETE', 'EXECUTE'):
+            book[side][px] = max(0, book[side].get(px,0) - qty)
+            if book[side].get(px,0) == 0: book[side].pop(px,None)
+        check_cross(seq)
+
+print(\"\"\"
+── What Causes a Crossed Book? ──────────────────────────────────
+  1. Feed error — bad tick with wrong price field
+  2. Out-of-order messages — DELETE arrives after a new ADD at a better price
+  3. Sequence gap — missed DELETE left a stale resting order in the book
+  4. Exchange matching engine bug (rare)
+
+  In a real exchange matching engine a crossed book triggers immediate
+  execution — it cannot persist. If your book is crossed, it's bad data.
+
+── Actions ─────────────────────────────────────────────────────
+  1. Alert market data operations team immediately
+  2. Mark book INVALID — halt pricing and routing for that symbol
+  3. Request snapshot to get clean book state
+  4. Log the event with the sequence number for post-trade review
+  5. Check if other symbols or feeds have the same issue
+\"\"\")
+""")
+    ok(f"Crossed book detector: {script}")
+
+    print(f"""
+{BOLD}── Your Tasks ─────────────────────────────────────────{RESET}
+  1. Run the crossed book detector — watch it fire at SEQ 4
+{CYAN}       python3 {script}{RESET}
+
+  2. Use awk to find the first moment best bid exceeds best ask
+{CYAN}       cat {log}{RESET}
+
+{BOLD}── Key Interview Points ───────────────────────────────{RESET}
+  • A crossed book (bid ≥ ask) NEVER happens legitimately — it's always bad data
+  • Crossed = missed DELETE + new ADD, or bad tick
+  • Response: invalidate book immediately, do not trade on crossed data
+  • Locked book (bid == ask) = unusual but can occur briefly during fast markets
+""")
+
+
+def launch_scenario_14():
+    header("Scenario MD-14 — Market Impact & Walking the Book")
+    print("  A large order consumes multiple price levels.")
+    print("  Calculate average fill price and market impact.\n")
+
+    import json as _json
+    book_file = DIRS["data"] / "deep_book.json"
+    book = {
+        "symbol": "AAPL",
+        "bids": {
+            "184.95": 1000, "184.90": 2500, "184.85": 1500,
+            "184.80": 3000, "184.75": 5000, "184.70": 8000,
+        },
+        "asks": {
+            "185.00": 800,  "185.05": 1200, "185.10": 2000,
+            "185.15": 1500, "185.20": 3500, "185.25": 6000,
+        },
+    }
+    book_file.write_text(_json.dumps(book, indent=2))
+    ok(f"Deep L2 book: {book_file}")
+
+    script = DIRS["scripts"] / "market_impact.py"
+    script.write_text(f"""\
+#!/usr/bin/env python3
+\"\"\"MD-14: Walk the order book with a large BUY order — show market impact.\"\"\"
+import json
+
+BOOK_FILE  = '{book_file}'
+ORDER_QTY  = 4500   # shares to BUY — this will walk through multiple levels
+
+with open(BOOK_FILE) as f:
+    book = json.load(f)
+
+asks = sorted((float(px), int(qty)) for px, qty in book['asks'].items())
+bids = sorted((float(px), int(qty)) for px, qty in book['bids'].items(), reverse=True)
+
+sym        = book['symbol']
+best_bid   = bids[0][0]
+best_ask   = asks[0][0]
+mid        = (best_bid + best_ask) / 2
+
+print(f"── {{sym}} Order Book ──────────────────────────────────")
+print(f"  Best bid: {{best_bid:.2f}}  Best ask: {{best_ask:.2f}}  Mid: {{mid:.4f}}")
+print(f"  Spread  : {{best_ask - best_bid:.4f}}")
+print()
+print(f"  {{' ASK PX':>10}}  {{'QTY':>8}}  {{'CUM QTY':>9}}")
+cum = 0
+for px, qty in asks:
+    cum += qty
+    print(f"  {{px:>10.2f}}  {{qty:>8}}  {{cum:>9}}")
+
+print(f"\\n── Walking book with BUY order for {{ORDER_QTY:,}} shares ──────")
+remaining    = ORDER_QTY
+filled_qty   = 0
+total_cost   = 0.0
+levels_hit   = 0
+fills        = []
+
+for px, available in asks:
+    if remaining <= 0:
+        break
+    take   = min(remaining, available)
+    cost   = take * px
+    fills.append((px, take, cost))
+    filled_qty  += take
+    total_cost  += cost
+    remaining   -= take
+    levels_hit  += 1
+    print(f"  Level {{levels_hit}}: fill {{take:>6}} @ {{px:.2f}}  (cost={{cost:>10,.2f}})  remaining={{remaining}}")
+
+avg_fill_px  = total_cost / filled_qty if filled_qty else 0
+slippage_bps = ((avg_fill_px - best_ask) / best_ask) * 10000
+impact_bps   = ((avg_fill_px - mid) / mid) * 10000
+
+print(f"\\n── Fill Summary ──────────────────────────────────────")
+print(f"  Order qty    : {{ORDER_QTY:,}}")
+print(f"  Filled qty   : {{filled_qty:,}}")
+print(f"  Unfilled     : {{remaining:,}}")
+print(f"  Best ask     : {{best_ask:.4f}}")
+print(f"  Avg fill px  : {{avg_fill_px:.4f}}")
+print(f"  Total cost   : ${{total_cost:,.2f}}")
+print(f"  Slippage     : {{slippage_bps:.2f}} bps  (vs best ask)")
+print(f"  Market impact: {{impact_bps:.2f}} bps  (vs mid)")
+print(f"  Levels hit   : {{levels_hit}}")
+
+print(f\"\"\"
+── Concepts ──────────────────────────────────────────────────────
+  Slippage     : avg fill price - best ask (cost of size vs top of book)
+  Market impact: avg fill price - mid (total deviation from fair value)
+  Basis points : 1 bps = 0.01% = price / 10,000
+
+  Why this matters for a support engineer:
+  - Execution algos (VWAP, TWAP, POV) try to minimize market impact
+  - If book depth data is wrong (stale/gapped) → algo miscalculates impact
+  - Wrong impact calc → algo sends too large an order → large slippage
+  - Your job: ensure the book fed to the algo is always FRESH and correct
+
+  VWAP  : execute evenly over a time window, target the daily VWAP price
+  TWAP  : execute equal qty every time slice (ignores volume)
+  POV   : participate at X% of market volume (book-depth dependent)
+  IS    : implementation shortfall — minimize deviation from arrival price
+\"\"\")
+""")
+    ok(f"Market impact script: {script}")
+
+    print(f"""
+{BOLD}── Your Tasks ─────────────────────────────────────────{RESET}
+  1. Inspect the deep book
+{CYAN}       cat {book_file}{RESET}
+
+  2. Run the market impact simulation
+{CYAN}       python3 {script}{RESET}
+
+  3. Use awk on the book file to compute total ask liquidity
+{CYAN}       python3 -c "import json; b=json.load(open('{book_file}')); \\
+           print(sum(int(v) for v in b['asks'].values()), 'shares on ask side')"{RESET}
+
+  4. Modify the order size in the script and re-run
+{CYAN}       # Change ORDER_QTY = 4500 to 10000 — see how many levels it walks{RESET}
+
+{BOLD}── Key Interview Points ───────────────────────────────{RESET}
+  • Market impact increases non-linearly with order size
+  • Stale book → algo underestimates depth → sends order too fast → more impact
+  • L2 book is what execution algos use; L3 gives per-order detail (rarer)
+  • Spread = bid-ask gap = transaction cost for aggressive orders
+  • Large orders need to be split across time (algo) or venues (SOR)
+""")
+
+
 def launch_scenario_99():
     header("Scenario 99 — ALL Market Data Scenarios")
     for fn in [launch_scenario_1, launch_scenario_2, launch_scenario_3,
                launch_scenario_4, launch_scenario_5, launch_scenario_6,
                launch_scenario_7, launch_scenario_8, launch_scenario_9,
-               launch_scenario_10]:
+               launch_scenario_10, launch_scenario_11, launch_scenario_12,
+               launch_scenario_13, launch_scenario_14]:
         fn()
         time.sleep(0.2)
 
@@ -1318,6 +1827,10 @@ SCENARIO_MAP = {
     8:  (launch_scenario_8,  "MD-08  Stale feed detection — heartbeat timeout"),
     9:  (launch_scenario_9,  "MD-09  Feed latency analysis — exchange timestamp"),
     10: (launch_scenario_10, "MD-10  NIC buffer tuning & drop detection"),
+    11: (launch_scenario_11, "MD-11  Book invalidation on sequence gap"),
+    12: (launch_scenario_12, "MD-12  Snapshot + incremental recovery"),
+    13: (launch_scenario_13, "MD-13  Crossed book detection"),
+    14: (launch_scenario_14, "MD-14  Market impact & walking the book"),
     99: (launch_scenario_99, "      ALL scenarios"),
 }
 
