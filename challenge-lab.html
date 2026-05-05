@@ -21,7 +21,10 @@
     --muted:   #64748b;
     --mono: 'Consolas', 'IBM Plex Mono', monospace;
     --sans: 'Trebuchet MS', 'Calibri', 'IBM Plex Sans', sans-serif;
+    --ui-zoom: 0.85;
   }
+
+  html { zoom: var(--ui-zoom); }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -66,7 +69,7 @@
   .layout {
     display: grid;
     grid-template-columns: 210px 1fr;
-    height: calc(100vh - 44px);
+    height: calc(100vh / var(--ui-zoom) - 44px);
   }
 
   /* ── Sidebar ── */
@@ -4342,8 +4345,8 @@ function applyZoom(idx) {
   idx = Math.max(0, Math.min(ZOOMS.length - 1, idx));
   zoomIdx = idx;
   const z = ZOOMS[idx];
-  // Apply to documentElement so 100vh stays correct and no gap appears
-  document.documentElement.style.zoom = z;
+  // CSS var drives both zoom and the compensating height formula
+  document.documentElement.style.setProperty('--ui-zoom', z);
   const lbl = document.getElementById('zoom-label');
   if (lbl) lbl.textContent = Math.round(z * 100) + '%';
   try { localStorage.setItem('uiZoom', idx); } catch(e) {}
