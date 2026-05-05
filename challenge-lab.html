@@ -4335,14 +4335,15 @@ function showDeck(id) {
 }
 
 // ── Zoom ──
-const ZOOMS = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00];
+const ZOOMS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00];
 let zoomIdx = ZOOMS.indexOf(0.85);
 
 function applyZoom(idx) {
   idx = Math.max(0, Math.min(ZOOMS.length - 1, idx));
   zoomIdx = idx;
   const z = ZOOMS[idx];
-  document.body.style.zoom = z;
+  // Apply to documentElement so 100vh stays correct and no gap appears
+  document.documentElement.style.zoom = z;
   const lbl = document.getElementById('zoom-label');
   if (lbl) lbl.textContent = Math.round(z * 100) + '%';
   try { localStorage.setItem('uiZoom', idx); } catch(e) {}
