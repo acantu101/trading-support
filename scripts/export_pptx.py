@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Export all slide decks from challenge-lab.html to individual .pptx files.
-Outputs: pptx_export/<deck>.pptx  +  trading-support-slides.zip
+Outputs: runbooks/<deck>.pptx  +  runbooks/trading-support-slides.zip
 """
 
 import os, sys, zipfile
@@ -453,8 +453,8 @@ def build_deck_pptx(deck_id, deck_el, output_dir):
 def main():
     here = Path(__file__).parent.parent
     html_path  = here / 'challenge-lab.html'
-    output_dir = here / 'pptx_export'
-    zip_path   = here / 'trading-support-slides.zip'
+    output_dir = here / 'runbooks'
+    zip_path   = here / 'runbooks' / 'trading-support-slides.zip'
 
     output_dir.mkdir(exist_ok=True)
 
